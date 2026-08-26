@@ -429,5 +429,4 @@ void aipu_mm_v3_flush_all_for_filp(struct aipu_memory_manager *mm, struct file *
 struct aipu_phy_block *aipu_get_block_buffer(struct aipu_memory_manager *mm, u64 iova, char* str);
 struct aipu_iova_buffer *aipu_get_iova_buffer_by_job_id(struct aipu_memory_manager *mm, u64 exec_id, char* str);
 int aipu_rebind_dma_iova_phy(struct aipu_memory_manager *mm, struct aipu_rebind_buf_desc *desc, struct file *filp);
-int aipu_bind_dma_iova_phy(struct aipu_memory_manager *mm, struct aipu_bind_buf_desc *desc, struct file *filp);
 #endif /* __AIPU_MM_H__ */

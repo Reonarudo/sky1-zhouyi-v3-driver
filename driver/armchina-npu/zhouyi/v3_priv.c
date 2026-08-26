@@ -64,12 +64,10 @@ static int init_aipu_partition(struct aipu_partition *partition, u32 *clusters, 
 	partition->cluster_cnt = cluster_cnt;
 	partition->ops->initialize(partition);
 
-#ifdef CONFIG_SYSFS
 	if (IS_ERR(aipu_common_create_attr(partition->dev, &partition->reg_attr, "ext_registers",
 					   0644, aipu_common_ext_register_sysfs_show,
 					   aipu_common_ext_register_sysfs_store)))
 		dev_err(partition->dev, "[init_partition] init sysfs <ext_registers> failed");
-#endif
 
 	partition->is_init = true;
 	return ret;

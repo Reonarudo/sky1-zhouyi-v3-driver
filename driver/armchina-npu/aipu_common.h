@@ -8,7 +8,6 @@
 #include "aipu_io.h"
 #include "aipu_irq.h"
 
-#ifdef CONFIG_SYSFS
 typedef ssize_t (*sysfs_show_t)(struct device *dev, struct device_attribute *attr, char *buf);
 typedef ssize_t (*sysfs_store_t)(struct device *dev, struct device_attribute *attr,
 				 const char *buf, size_t count);
@@ -34,7 +33,6 @@ struct device_attribute *aipu_common_create_attr(struct device *dev,
 						 const char *name, int mode,
 						 sysfs_show_t show, sysfs_store_t store);
 void aipu_common_destroy_attr(struct device *dev, struct device_attribute **attr);
-#endif
 int aipu_common_init_reg_irq(struct platform_device *p_dev, struct aipu_partition *partition,
 			     struct io_region *reg, struct aipu_irq_object **irq_obj);
 

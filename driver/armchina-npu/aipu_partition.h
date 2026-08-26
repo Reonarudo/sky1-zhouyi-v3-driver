@@ -52,9 +52,7 @@ struct aipu_operations {
 	int (*io_rw)(struct aipu_partition *aipu, struct aipu_io_req *io_req);
 	int (*upper_half)(void *data);
 	void (*bottom_half)(void *data);
-#ifdef CONFIG_SYSFS
 	int (*sysfs_show)(struct aipu_partition *aipu, char *buf);
-#endif
 	int (*soft_reset)(struct aipu_partition *aipu, bool init_regs);
 	void (*initialize)(struct aipu_partition *aipu);
 	int (*destroy_command_pool)(struct aipu_partition *partition, int pool);

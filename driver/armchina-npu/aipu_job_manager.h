@@ -220,7 +220,6 @@ void aipu_job_manager_irq_upper_half(struct aipu_partition *core, int exception_
 				     struct job_irq_info *info);
 void aipu_job_manager_irq_bottom_half(struct aipu_partition *core);
 int aipu_job_manager_cancel_jobs(struct aipu_job_manager *manager, struct file *filp);
-int aipu_job_manager_invalidate_timeout_job(struct aipu_job_manager *manager, int job_id);
 int aipu_job_manager_get_job_status(struct aipu_job_manager *manager,
 				    struct aipu_job_status_query *job_status, struct file *filp);
 bool aipu_job_manager_has_end_job(struct aipu_job_manager *manager, struct file *filp,

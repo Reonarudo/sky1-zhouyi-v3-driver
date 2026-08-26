@@ -15,7 +15,6 @@
 #define ADDR_VALUE 2
 #define ADDR_ONLY  1
 
-#ifdef CONFIG_SYSFS
 ssize_t aipu_common_ext_register_sysfs_show(struct device *dev,
 					    struct device_attribute *attr,
 					    char *buf)
@@ -254,7 +253,6 @@ void aipu_common_destroy_attr(struct device *dev, struct device_attribute **attr
 	kfree(*attr);
 	*attr = NULL;
 }
-#endif
 
 int aipu_common_init_reg_irq(struct platform_device *p_dev, struct aipu_partition *partition,
 			     struct io_region *reg, struct aipu_irq_object **irq_obj)

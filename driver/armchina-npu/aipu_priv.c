@@ -5,10 +5,7 @@
 #include <linux/of_address.h>
 #include "aipu_priv.h"
 #include "config.h"
-#include "v1.h"
-#include "v2.h"
 #include "v3.h"
-#include "v3_2.h"
 
 static int init_misc_dev(struct aipu_priv *aipu)
 {
@@ -81,21 +78,9 @@ int init_aipu_priv(struct aipu_priv *aipu, struct platform_device *p_dev,
 	aipu->version = version;
 	aipu->revision = revision;
 
-#if defined(CONFIG_ARMCHINA_NPU_ARCH_V3_2)
-	if (version >= AIPU_ISA_VERSION_ZHOUYI_V3_2) {
-		aipu->ops = get_v3_2_priv_ops();
-		aipu->core_reset_delay_us = AIPU_CONFIG_CORE_RESET_DELAY_US;
-	}
-#endif
-
 #ifdef CONFIG_ARMCHINA_NPU_ARCH_V3
 	if (version == AIPU_ISA_VERSION_ZHOUYI_V3)
 		aipu->ops = get_v3_priv_ops();
-#endif
-
-#if (defined CONFIG_ARMCHINA_NPU_ARCH_V1) || (defined CONFIG_ARMCHINA_NPU_ARCH_V2)
-	if (version > 0 && version <= AIPU_ISA_VERSION_ZHOUYI_V2_2)
-		aipu->ops = get_v1v2_priv_ops();
 #endif
 
 	if (!aipu->ops) {

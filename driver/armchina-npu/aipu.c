@@ -10,7 +10,6 @@
 #include <linux/fs.h>
 #include <linux/uaccess.h>
 #include <linux/poll.h>
-#include <linux/compat.h>
 #include <armchina_aipu.h>
 #include "armchina_aipu_soc.h"
 #include "aipu_mm.h"
@@ -100,9 +99,7 @@ static long aipu_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	struct aipu_running_job_query running_job_query;
 	int fd = 0;
 
-	u64 job_id;
 	struct aipu_rebind_buf_desc rebind_buf;
-	struct aipu_bind_buf_desc bind_buf;
 
 	switch (cmd) {
 	case AIPU_IOCTL_QUERY_CAP:
@@ -178,10 +175,7 @@ static long aipu_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		}
 		break;
 	case AIPU_IOCTL_KILL_TIMEOUT_JOB:
-		if (!copy_from_user(&job_id, (u64 __user *)arg, sizeof(job_id)))
-			ret = aipu_job_manager_invalidate_timeout_job(manager, job_id);
-		else
-			ret = -EINVAL;
+		ret = -EINVAL;
 		break;
 	case AIPU_IOCTL_REQ_IO:
 		if (!copy_from_user(&io_req, (struct aipu_io_req __user *)arg, sizeof(io_req))) {
@@ -341,14 +335,7 @@ static long aipu_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			ret = -EINVAL;
 		break;
 	case AIPU_IOCTL_BIND_DMA_BUF:
-		if (!copy_from_user(&bind_buf, (struct buf_desc __user *)arg, sizeof(bind_buf))) {
-			ret = aipu_bind_dma_iova_phy(&aipu->mm, &bind_buf, filp);
-			if (!ret &&
-			    copy_to_user((struct aipu_buf_request __user *)arg, &bind_buf,
-					 sizeof(bind_buf)))
-				ret = -EINVAL;
-		} else
-			ret = -EINVAL;
+		ret = -EINVAL;
 		break;
 	case AIPU_IOCTL_BUF_CACHE_INVALID:
 		if (!copy_from_user(&desc, (struct buf_desc __user *)arg, sizeof(desc)))
@@ -369,15 +356,6 @@ static long aipu_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 
 	return ret;
 }
-
-#ifdef CONFIG_COMPAT
-static long aipu_compat_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
-{
-	arg = (unsigned long)compat_ptr(arg);
-
-	return aipu_ioctl(filp, cmd, arg);
-}
-#endif
 
 static int aipu_mmap(struct file *filp, struct vm_area_struct *vma)
 {
@@ -402,9 +380,6 @@ static const struct file_operations aipu_fops = {
 	.open = aipu_open,
 	.poll = aipu_poll,
 	.unlocked_ioctl = aipu_ioctl,
-#ifdef CONFIG_COMPAT
-	.compat_ioctl = aipu_compat_ioctl,
-#endif
 	.mmap = aipu_mmap,
 	.release = aipu_release,
 };

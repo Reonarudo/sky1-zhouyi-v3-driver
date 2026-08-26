@@ -1,16 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0
 /* Copyright (c) 2023-2025 Arm Technology (China) Co. Ltd. */
 
-#include <linux/version.h>
 #include <linux/module.h>
 #include "aipu_dma_buf.h"
 
-#if KERNEL_VERSION(4, 19, 0) > LINUX_VERSION_CODE
-static int aipu_dma_buf_attach(struct dma_buf *dmabuf, struct device *dev,
-			       struct dma_buf_attachment *attach)
-#else
 static int aipu_dma_buf_attach(struct dma_buf *dmabuf, struct dma_buf_attachment *attach)
-#endif
 {
 	return 0;
 }
@@ -39,11 +33,7 @@ static struct sg_table *aipu_map_dma_buf(struct dma_buf_attachment *attach,
 		return NULL;
 	}
 
-#if KERNEL_VERSION(5, 8, 0) > LINUX_VERSION_CODE
-	ret = dma_map_sg(attach->dev, sgt->sgl, sgt->nents, dir);
-#else
 	ret = dma_map_sgtable(attach->dev, sgt, dir, 0);
-#endif
 	if (ret) {
 		dev_err(priv->mm->dev, "failed to map sgtable for attached dev\n");
 		sg_free_table(sgt);
@@ -57,11 +47,7 @@ static struct sg_table *aipu_map_dma_buf(struct dma_buf_attachment *attach,
 static void aipu_unmap_dma_buf(struct dma_buf_attachment *attach, struct sg_table *sgt,
 			       enum dma_data_direction dir)
 {
-#if KERNEL_VERSION(5, 8, 0) > LINUX_VERSION_CODE
-	dma_unmap_sg(attach->dev, sgt->sgl, sgt->nents, dir);
-#else
 	dma_unmap_sgtable(attach->dev, sgt, dir, 0);
-#endif
 	sg_free_table(sgt);
 	kfree(sgt);
 }
@@ -79,53 +65,21 @@ static int aipu_dma_buf_mmap(struct dma_buf *dmabuf, struct vm_area_struct *vma)
 	return ret;
 }
 
-#if KERNEL_VERSION(5, 11, 0) > LINUX_VERSION_CODE
-static void *aipu_dma_vmap(struct dma_buf *dmabuf)
-#elif KERNEL_VERSION(5, 18, 0) > LINUX_VERSION_CODE
-static int aipu_dma_vmap(struct dma_buf *dmabuf, struct dma_buf_map *map)
-#else
 static int aipu_dma_vmap(struct dma_buf *dmabuf, struct iosys_map *map)
-#endif
 {
 	struct aipu_dma_buf_priv *priv = (struct aipu_dma_buf_priv *)dmabuf->priv;
-#if KERNEL_VERSION(5, 11, 0) > LINUX_VERSION_CODE
-	return priv->va;
-#else
 	map->is_iomem = false;
 	map->vaddr = priv->va;
 	return 0;
-#endif
 }
 
-#if KERNEL_VERSION(5, 11, 0) > LINUX_VERSION_CODE
-static void aipu_dma_vunmap(struct dma_buf *dmabuf, void *vaddr)
-#elif KERNEL_VERSION(5, 18, 0) > LINUX_VERSION_CODE
-static void aipu_dma_vunmap(struct dma_buf *dmabuf, struct dma_buf_map *map)
-#else
 static void aipu_dma_vunmap(struct dma_buf *dmabuf, struct iosys_map *map)
-#endif
 {
 }
 
 static void aipu_dma_release(struct dma_buf *dmabuf)
 {
 }
-
-#if ((KERNEL_VERSION(5, 6, 0) > LINUX_VERSION_CODE) && \
-	(KERNEL_VERSION(4, 11, 12) < LINUX_VERSION_CODE))
-static void *aipu_dma_map(struct dma_buf *dmabuf, unsigned long page_num)
-{
-	return NULL;
-}
-#endif
-
-#if ((KERNEL_VERSION(4, 19, 0) > LINUX_VERSION_CODE) && \
-	(KERNEL_VERSION(4, 11, 12) < LINUX_VERSION_CODE))
-void *aipu_dma_map_atomic(struct dma_buf *dmabuf, unsigned long page_num)
-{
-	return NULL;
-}
-#endif
 
 static struct dma_buf_ops aipu_dma_buf_ops = {
 	.attach = aipu_dma_buf_attach,
@@ -136,14 +90,6 @@ static struct dma_buf_ops aipu_dma_buf_ops = {
 	.vmap   = aipu_dma_vmap,
 	.vunmap = aipu_dma_vunmap,
 	.release = aipu_dma_release,
-#if ((KERNEL_VERSION(5, 6, 0) > LINUX_VERSION_CODE) && \
-	(KERNEL_VERSION(4, 11, 12) < LINUX_VERSION_CODE))
-	.map = aipu_dma_map,
-#endif
-#if ((KERNEL_VERSION(4, 19, 0) > LINUX_VERSION_CODE) && \
-	(KERNEL_VERSION(4, 11, 12) < LINUX_VERSION_CODE))
-	.map_atomic = aipu_dma_map_atomic,
-#endif
 };
 
 int aipu_alloc_dma_buf(struct aipu_memory_manager *mm, struct aipu_dma_buf_request *request)
@@ -159,37 +105,7 @@ int aipu_alloc_dma_buf(struct aipu_memory_manager *mm, struct aipu_dma_buf_reque
 
 	if (!mm || !request || !request->bytes)
 		return -EINVAL;
-	if(mm->version >= AIPU_ISA_VERSION_ZHOUYI_V3_2 && mm->has_iommu) {
-		memset(&inter_req, 0, sizeof(struct aipu_buf_request));
-		inter_req.bytes = request->bytes;
-		inter_req.align_in_page = 1;
-		inter_req.region = AIPU_BUF_REGION_DEFAULT;
-		inter_req.asid = AIPU_BUF_ASID_0;
-		inter_req.reserve_iova_size = 0;
-#if AIPU_USE_STANDARD_DMA_API_FOR_V3_2
-		inter_req.exec_id = 0;
-		inter_req.alloc_mode = AIPU_DMA_BUF_MALLOC_DEFAULT;
-#else
-		inter_req.exec_id = DMA_BUF_EXEC_ID;
-		inter_req.alloc_mode = AIPU_DMA_BUF_MALLOC_IOVA_PHY;
-#endif
-		ret = aipu_alloc_dma_iova_phy(mm,  &inter_req, NULL);
-		if (ret) {
-			dev_err(mm->dev, "alloc phy memory fail.");
-			return ret;
-		}
-#if AIPU_USE_STANDARD_DMA_API_FOR_V3_2
-		va = aipu_mm_get_va(mm, inter_req.desc.pa);
-		if (!va) {
-			ret = -EFAULT;
-			goto fail;
-		}
-#else
-		block = aipu_get_block_buffer(mm, inter_req.desc.pa, "aipu_alloc_dma_buf");
-		va = block->va;
-#endif
-	} else {
-		memset(&inter_req, 0, sizeof(struct aipu_buf_request));
+	memset(&inter_req, 0, sizeof(struct aipu_buf_request));
 		inter_req.bytes = request->bytes;
 		inter_req.align_in_page = 1;
 		inter_req.region = AIPU_BUF_REGION_DEFAULT;
@@ -217,7 +133,6 @@ int aipu_alloc_dma_buf(struct aipu_memory_manager *mm, struct aipu_dma_buf_reque
 			ret = -EFAULT;
 			goto fail;
 		}
-	}
 
 	priv = devm_kzalloc(mm->dev, sizeof(*priv), GFP_KERNEL);
 	if (!priv) {
@@ -246,18 +161,13 @@ int aipu_alloc_dma_buf(struct aipu_memory_manager *mm, struct aipu_dma_buf_reque
 		goto fail;
 	}
 
-	if(mm->version >= AIPU_ISA_VERSION_ZHOUYI_V3_2)
-		block->dmabuf = dmabuf;
 	request->fd = dma_buf_fd(dmabuf, exp.flags);
 	return 0;
 
 fail:
 	if (priv)
 		devm_kfree(mm->dev, priv);
-	if(mm->version >= AIPU_ISA_VERSION_ZHOUYI_V3_2)
-		aipu_free_dma_iova_phy(mm, &inter_req.desc, NULL);
-	else
-		aipu_mm_free(mm, &inter_req.desc, NULL, true);
+	aipu_mm_free(mm, &inter_req.desc, NULL, true);
 	return ret;
 }
 
@@ -284,15 +194,7 @@ int aipu_free_dma_buf(struct aipu_memory_manager *mm, int fd)
 	buf.bytes = priv->bytes;
 	buf.region = AIPU_BUF_REGION_DEFAULT;
 	buf.asid = AIPU_BUF_ASID_0;
-	if(mm->has_iommu && mm->version >= AIPU_ISA_VERSION_ZHOUYI_V3_2) {
-#if AIPU_USE_STANDARD_DMA_API_FOR_V3_2
 		buf.exec_id = 0;
-#else
-		buf.exec_id = DMA_BUF_EXEC_ID;
-#endif
-	} else {
-		buf.exec_id = 0;
-	}
 
 	ret = aipu_free_dma_iova_phy(mm, &buf, NULL);
 
@@ -460,10 +362,4 @@ void aipu_detach_dma_buf_by_filp(struct aipu_memory_manager *mm, struct file *fi
 	mutex_unlock(&mm->lock);
 }
 
-#if KERNEL_VERSION(5, 4, 0) < LINUX_VERSION_CODE
-#if KERNEL_VERSION(6, 13, 0) > LINUX_VERSION_CODE
-MODULE_IMPORT_NS(DMA_BUF);
-#else
 MODULE_IMPORT_NS("DMA_BUF");
-#endif
-#endif

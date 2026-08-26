@@ -33,7 +33,6 @@
 #define ZHOUYI_V2_2_REVISION_ID               0x300
 #define ZHOUYI_V3_REVISION_ID_R0P2            0x10000
 #define ZHOUYI_V3_REVISION_ID_R0P3            0x10003
-#define ZHOUYI_V3_2_REVISION_ID_R1P0          0x10210
 
 /*
  * Soft Reset
@@ -52,7 +51,6 @@
  */
 #define ZHOUYI_COMMAND_POOL_DEFAULT           0
 #define ZHOUYI_COMMAND_POOL_PCP               0
-#define ZHOUYI_V3_2_COMMAND_POOL_FULL         0xFFFF
 
 #define PARTITION_MODE_NONE                   0
 
@@ -90,10 +88,8 @@ void zhouyi_clear_done_interrupt(struct io_region *io);
 void zhouyi_clear_excep_interrupt(struct io_region *io);
 void zhouyi_io_rw(struct io_region *io, struct aipu_io_req *io_req);
 int zhouyi_detect_aipu_version(struct platform_device *p_dev, int *version, int *config, int *rev);
-#ifdef CONFIG_SYSFS
 int zhouyi_print_reg_info(struct io_region *io, char *buf, const char *name, int offset);
 int zhouyi_sysfs_show(struct io_region *io, char *buf);
-#endif
 int zhouyi_get_hw_version_number(struct io_region *io, int *rev);
 int zhouyi_get_hw_config_number(struct io_region *io);
 int zhouyi_soft_reset(struct io_region *io, int offset, int delay_us);

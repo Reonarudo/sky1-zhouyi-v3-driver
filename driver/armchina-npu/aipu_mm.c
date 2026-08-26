@@ -14,7 +14,6 @@
 #include <linux/vmalloc.h>
 #include <linux/iommu.h>
 #include <linux/bitmap.h>
-#include <linux/version.h>
 #include <linux/iova.h>
 #include <linux/dma-mapping.h>
 #include <linux/acpi.h>
@@ -23,7 +22,6 @@
 #include "aipu_mm.h"
 #include "aipu_common.h"
 #include "aipu_dma_buf.h"
-#include "v2.h"
 
 /*
  * DEBUG: V3 custom-IOVA lifecycle tracing (DPTSW-23453 SMMU event 0x10).
@@ -441,17 +439,6 @@ enum iommu_dma_cookie_type {
 	IOMMU_DMA_MSI_COOKIE,
 };
 
-#if KERNEL_VERSION(6, 15, 0) > LINUX_VERSION_CODE
-struct iommu_dma_cookie {
-	enum iommu_dma_cookie_type	type;
-	union {
-		struct iova_domain	iovad;
-		dma_addr_t		msi_iova;
-	};
-	struct list_head		msi_page_list;
-	struct iommu_domain		*fq_domain;
-};
-#else
 /*
  * Partial redefinition of the kernel-private struct iommu_dma_cookie
  * (defined in drivers/iommu/dma-iommu.c). Only the iovad field is accessed
@@ -460,7 +447,6 @@ struct iommu_dma_cookie {
 struct iommu_dma_cookie {
 	struct iova_domain      iovad;
 };
-#endif
 
 struct exporter_dma_buf {
 	void *vaddr;
@@ -484,19 +470,10 @@ static struct aipu_tcb_buf *aipu_mm_v3_find_tcb_buf_no_lock(struct aipu_memory_m
 							    u64 pa);
 static int init_cache_ops(struct aipu_memory_manager *mm);
 static void aipu_debug_print_buffers(struct aipu_memory_manager *mm);
-static int aipu_free_all_dma_iova_phy(struct aipu_memory_manager *mm, struct file *filp);
 static struct aipu_iova_buffer *aipu_get_iova_buffer(struct aipu_memory_manager *mm, u64 iova, char* str);
 static struct device *aipu_mm_create_child_dev(struct device *dev, u32 idx)
 {
 	struct device *child = NULL;
-
-#if (KERNEL_VERSION(4, 11, 0) > LINUX_VERSION_CODE)
-	if (idx) {
-		dev_err(dev, "multiple mem regions are not supported (idx %d)\n", idx);
-		return NULL;
-	}
-	return dev;
-#endif
 
 	child = devm_kzalloc(dev, sizeof(*child), GFP_KERNEL);
 	if (!child)
@@ -513,11 +490,7 @@ static struct device *aipu_mm_create_child_dev(struct device *dev, u32 idx)
 	if (!child->dma_parms)
 		goto err;
 
-#if KERNEL_VERSION(5, 10, 0) > LINUX_VERSION_CODE
-	child->dma_pfn_offset = dev->dma_pfn_offset;
-#else
 	child->dma_range_map = dev->dma_range_map;
-#endif
 
 	return child;
 
@@ -1370,20 +1343,10 @@ static int aipu_mm_reserved_iova_for_never_map(struct aipu_memory_manager *mm, b
 		return -EINVAL;
 
 	iommu_domain = mm->iommu_domain;
-	if (mm->version == AIPU_ISA_VERSION_ZHOUYI_V3_2) {
-		iova_len = SZ_512M;
-
-		iovad = &mm->iova_domain;
-	} else {
 	cookie = iommu_domain->iova_cookie;
 	iovad = &cookie->iovad;
-	}
 
-#if (KERNEL_VERSION(5, 5, 0) <= LINUX_VERSION_CODE)
 	bus_dma_limit = mm->dev->bus_dma_limit;
-#elif (KERNEL_VERSION(4, 19, 0) <= LINUX_VERSION_CODE)
-	bus_dma_limit = mm->dev->bus_dma_mask;
-#endif
 	if (bus_dma_limit == 0xc0000000 || bus_dma_limit == 0xe0000000)
 		bus_dma_limit = 0x100000000;
 
@@ -1398,68 +1361,6 @@ static int aipu_mm_reserved_iova_for_never_map(struct aipu_memory_manager *mm, b
 	} while (bus_dma_limit > 0);
 
 	return 0;
-}
-
-static __maybe_unused int aipu_mm_add_iova_region(struct aipu_memory_manager *mm)
-{
-	struct aipu_mem_region_obj *obj = NULL;
-	struct aipu_mem_region *reg = NULL;
-	int iova_region = 1;
-	unsigned long iova_region_size = 0xc0000000;
-	int asid_idx = 0;
-	int region_idx = 0;
-
-	if (!mm)
-		return -EINVAL;
-
-	if (mm->version == AIPU_ISA_VERSION_ZHOUYI_V3_2)
-		iova_region_size = 0xe0000000;
-
-#if (KERNEL_VERSION(5, 5, 0) <= LINUX_VERSION_CODE)
-	mm->dev->bus_dma_limit = 0x800000000;
-#elif (KERNEL_VERSION(4, 19, 0) <= LINUX_VERSION_CODE)
-	mm->dev->bus_dma_mask = 0x800000000;
-#endif
-	mm->dma_mask = 35;
-
-	if (aipu_mm_reserved_iova_for_never_map(mm, IOVA_ALLOC)) {
-		dev_err(mm->dev, "fail to reserve iova region for never map.");
-		mm->dma_mask = 32;
-#if (KERNEL_VERSION(5, 5, 0) <= LINUX_VERSION_CODE)
-		mm->dev->bus_dma_limit = 0xc0000000;
-#elif (KERNEL_VERSION(4, 19, 0) <= LINUX_VERSION_CODE)
-		mm->dev->bus_dma_mask = 0xc0000000;
-#endif
-		goto FINISH;
-	}
-
-	do {
-		obj = aipu_mm_create_region_object(mm, AIPU_MEM_REGION_TYPE_MEMORY,
-						   iova_region_size, 0, asid_idx, NULL, true);
-		if (!obj) {
-			dev_err(mm->dev, "create iova region failed (ret = %ld)", PTR_ERR(reg));
-			mm->dma_mask = 32;
-#if (KERNEL_VERSION(5, 5, 0) <= LINUX_VERSION_CODE)
-			mm->dev->bus_dma_limit = 0xc0000000;
-#elif (KERNEL_VERSION(4, 19, 0) <= LINUX_VERSION_CODE)
-			mm->dev->bus_dma_mask = 0xc0000000;
-#endif
-			break;
-		}
-
-		reg = obj->reg;
-
-		list_add(&obj->list, &mm->mem.head->list);
-		if (mm->version > AIPU_ISA_VERSION_ZHOUYI_V1)
-			add_region_list(mm, asid_idx, reg);
-		else
-			add_region_list(mm, AIPU_BUF_ASID_0, reg);
-		asid_idx++;
-		region_idx++;
-	} while (region_idx < iova_region);
-
-FINISH:
-	return region_idx;
 }
 
 static int aipu_mm_add_reserved_regions(struct aipu_memory_manager *mm)
@@ -1497,7 +1398,7 @@ static int aipu_mm_add_reserved_regions(struct aipu_memory_manager *mm)
 		}
 
 		/* bypass mapping SoC SRAM if CPU cannot access it */
-		if (type == AIPU_MEM_REGION_TYPE_SRAM && !AIPU_CONFIG_HOST_MAP_SRAM) {
+		if (type == AIPU_MEM_REGION_TYPE_SRAM) {
 			dev_info(mm->dev, "dts: bypass this sram region (cpu cannot access it)\n");
 			continue;
 		}
@@ -1521,11 +1422,6 @@ static int aipu_mm_add_reserved_regions(struct aipu_memory_manager *mm)
 		}
 
 		size = res.end - res.start + 1;
-		if (type == AIPU_MEM_REGION_TYPE_DTCM && size > ZHOUYI_V2_DTCM_MAX_BYTES) {
-			dev_info(mm->dev,
-				 "the DTCM will be clipped to the maximum configurable value\n");
-			size = ZHOUYI_V2_DTCM_MAX_BYTES;
-		}
 
 		if (of_property_read_u64(np, "host-aipu-offset", &offset))
 			offset = 0;
@@ -1736,26 +1632,7 @@ int aipu_init_mm(struct aipu_memory_manager *mm, struct platform_device *p_dev, 
 	if (group) {
 		mm->has_iommu = true;
 		mm->iommu_domain = iommu_get_domain_for_dev(mm->dev);
-		if (mm->version >= AIPU_ISA_VERSION_ZHOUYI_V3_2) {
-			mm->valid_asid_cnt = 0;
-			mm->iova_base = 0x100000000ULL;   // start from 4GB
-			mm->iova_size = 0x800000000ULL;  // total szie 32GB
-
-#if (KERNEL_VERSION(4, 15, 0) <= LINUX_VERSION_CODE)
-			init_iova_domain(&mm->iova_domain, PAGE_SIZE,
-					mm->iova_base >> PAGE_SHIFT);
-#else
-			init_iova_domain(&mm->iova_domain, PAGE_SIZE,
-					mm->iova_base >> PAGE_SHIFT,
-					DMA_BIT_MASK(36)>>PAGE_SHIFT);
-#endif
-			mm->buffer_count = 0;
-			mutex_init(&mm->buffer_mutex);
-			INIT_LIST_HEAD(&mm->buffer_list);
-			mm->host_aipu_offset = 0;
-			init_cache_ops(mm);
-			mm->dma_mask = 36;
-		} else if (mm->version == AIPU_ISA_VERSION_ZHOUYI_V3) {
+		if (mm->version == AIPU_ISA_VERSION_ZHOUYI_V3) {
 			/*
 			 * V3 + IOMMU: Use custom IOVA domain to support per-ASID 3GB range
 			 * Enable discrete physical page allocation while keeping TCB
@@ -1790,20 +1667,12 @@ int aipu_init_mm(struct aipu_memory_manager *mm, struct platform_device *p_dev, 
 		 * V3 + IOMMU (fallback mode): constrain DMA to 32-bit / 3GB
 		 * This is the original behavior when custom IOVA fails.
 		 */
-#if (KERNEL_VERSION(5, 5, 0) <= LINUX_VERSION_CODE)
 		mm->dev->bus_dma_limit = 0xc0000000;
-#elif (KERNEL_VERSION(4, 19, 0) <= LINUX_VERSION_CODE)
-		mm->dev->bus_dma_mask = 0xc0000000;
-#endif
 		mm->dma_mask = 32;
 		mm->default_asid_size = SZ_2G;
 		if (aipu_mm_reserved_iova_for_never_map(mm, IOVA_ALLOC))
 			dev_warn(mm->dev, "failed to reserve iova forbidden zones");
 	}
-#if AIPU_USE_STANDARD_DMA_API_FOR_V3_2
-	else if (mm->version == AIPU_ISA_VERSION_ZHOUYI_V3_2)
-		mm->res_cnt = aipu_mm_add_iova_region(mm);
-#endif
 
 	if (version > AIPU_ISA_VERSION_ZHOUYI_V1 && mm->res_cnt)
 		aipu_mm_set_asid_base(mm);
@@ -1971,15 +1840,11 @@ static bool aipu_mm_check_address_validity(struct aipu_memory_manager *mm,
 		lower_bound = asid_base + size_4G - SZ_1G;
 		upper_bound = asid_base + size_4G;
 
-		if (mm->version == AIPU_ISA_VERSION_ZHOUYI_V3_2) {
-			lower_bound += SZ_512M;
-		} else {
 			if (desc->asid > AIPU_BUF_ASID_0) {
 				asid0_base = aipu_mm_get_asid_base(mm, AIPU_BUF_ASID_0);
 				if (asid0_base != asid_base)
 					lower_bound += SZ_512M;
 			}
-		}
 
 		desc_end = desc->pa + desc->bytes;
 		if (desc->pa < upper_bound && desc_end >= lower_bound)
@@ -2375,9 +2240,6 @@ void aipu_mm_free_buffers(struct aipu_memory_manager *mm, struct file *filp)
 		return;
 	}
 
-	if (mm->version >= AIPU_ISA_VERSION_ZHOUYI_V3_2 && mm->has_iommu)
-		aipu_free_all_dma_iova_phy(mm, filp);
-
 	mutex_lock(&mm->lock);
 	list_for_each_entry_safe(obj, next, &mm->mem.head->list, list) {
 		if (obj->reg->filp == filp)
@@ -2440,17 +2302,8 @@ int aipu_mm_mmap_buf(struct aipu_memory_manager *mm, struct vm_area_struct *vma,
 
 	dev_pa = vma->vm_pgoff << PAGE_SHIFT;
 
-#if KERNEL_VERSION(6, 3, 0) <= LINUX_VERSION_CODE || \
-	(defined(__ANDROID_COMMON_KERNEL__) && KERNEL_VERSION(6, 1, 43) <= LINUX_VERSION_CODE)
 	vm_flags_set(vma, VM_IO);
-#else
-	vma->vm_flags |= VM_IO;
-#endif
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 19, 0)
 	vma->vm_page_prot = pgprot_dmacoherent(vma->vm_page_prot);
-#else
-	vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
-#endif
 
 	/* V3 custom IOVA: dev_pa is NPU view, convert to IOVA */
 	if (mm->version == AIPU_ISA_VERSION_ZHOUYI_V3 && 
@@ -2474,18 +2327,6 @@ int aipu_mm_mmap_buf(struct aipu_memory_manager *mm, struct vm_area_struct *vma,
 		ret = aipu_vma_map_pages(vma, block->pages, block->page_count);
 		if (ret)
 			dev_err(mm->dev, "V3 mmap failed at pa 0x%llx (ret = %d)", dev_pa, ret);
-	}
-	/* V3.2 path */
-	else if(mm->version >= AIPU_ISA_VERSION_ZHOUYI_V3_2 && mm->has_iommu) {
-		iova = dev_pa;
-		block = aipu_get_block_buffer(mm, iova, "mmap");
-		if(!block)
-			return -EINVAL;
-
-		vma->vm_pgoff = 0;
-		ret = aipu_vma_map_pages(vma, block->pages, block->page_count);
-		if (ret)
-			dev_err(mm->dev, "dma mmap failed at iova 0x%llx (ret = %d)", iova, ret);
 	} else {
 		iova = dev_pa;
 		reg = aipu_mm_find_region(mm, iova, "mmap");
@@ -3473,11 +3314,7 @@ static struct page **aipu_dma_alloc_pages(struct device *dev,
 	struct page **pages;
 	unsigned int i = 0, nid = dev_to_node(dev);
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 8, 0)
 	order_mask &= (2U << MAX_PAGE_ORDER) - 1;
-#else
-	order_mask &= (2U << MAX_ORDER) - 1;
-#endif
 	if (!order_mask)
 		return NULL;
 
@@ -4078,117 +3915,6 @@ OUT:
 	return ret;
 }
 
-int aipu_bind_dma_iova_phy(struct aipu_memory_manager *mm, struct aipu_bind_buf_desc *desc, struct file *filp)
-{
-	u64 exec_id = desc->exec_id;
-	struct aipu_iova_buffer* buffer;
-	struct aipu_phy_block *block;
-	int ret = 0;
-	struct dma_buf *dmabuf = NULL;
-	struct exporter_dma_buf *exp_buf = dmabuf->priv;
-
-	if (!mm || !desc)
-		return -EINVAL;
-
-	//bind new iova buffer
-	buffer = aipu_get_iova_buffer_by_exec_id(mm, exec_id, "rebind dma buf");
-	if (!buffer) {
-		return -EINVAL;
-	}
-
-	//handle before iova buffer;
-	dmabuf = dma_buf_get(desc->fd);
-	if(IS_ERR(dmabuf)) {
-		dev_err(mm->dev, "fail to get dmabuf from fd.\n");
-		return -EINVAL;
-	}
-
-	if ((buffer->allocated_size + dmabuf->size) > buffer->iova_size) {
-		dev_err(mm->dev, "iova space is not enough for phy memory allcation.");
-		return -EINVAL;
-	}
-
-	block = kzalloc(sizeof(*block), GFP_KERNEL);
-	if (!block)
-		return -ENOMEM;
-
-	exp_buf = dmabuf->priv;
-
-	block->size = dmabuf->size;
-	block->page_count = dmabuf->size>>PAGE_SHIFT;
-	block->sgt.nents = block->page_count;
-	//block->dmabuf = dmabuf;
-	block->dmabuf = NULL;
-	block->pages = exp_buf->pages;
-	block->bind_memory = true;
-
-	INIT_LIST_HEAD(&block->list);
-
-	aipu_add_block_into_buffer(buffer, block);
-
-	ret = aipu_map_sg_to_iommu(mm, block);
-	if (ret) {
-		dev_err(mm->dev, "Map block to new iova 0x%llx size 0x%llx FAILED.\n", block->iova_start, block->size);
-		aipu_free_phy_block(mm, block);
-		goto OUT;
-	}
-	desc->pa = block->iova_start;
-	aipu_cache_invalidate(mm, block->va, block->size);
-
-OUT:
-	return ret;
-}
-
-static int aipu_free_all_dma_iova_phy(struct aipu_memory_manager *mm, struct file *filp)
-{
-	struct aipu_iova_buffer* buffer, *tmp1;
-	struct aipu_phy_block *block, *tmp;
-	struct aipu_iova_buffer** pbuf;
-	int buffer_count = 0;
-	int index = 0;
-
-	mutex_lock(&mm->buffer_mutex);
-	list_for_each_entry(buffer,&mm->buffer_list, node) {
-		if(buffer->filp == filp)
-			buffer_count++;
-	}
-	mutex_unlock(&mm->buffer_mutex);
-
-	if (buffer_count == 0)
-		return 0;
-
-	pbuf = kzalloc(buffer_count * sizeof(*buffer), GFP_KERNEL);
-	if (!pbuf)
-		return -ENOMEM;
-
-	mutex_lock(&mm->buffer_mutex);
-	list_for_each_entry_safe(buffer, tmp1, &mm->buffer_list, node) {
-		if(buffer->filp == filp) {
-			pbuf[index] = buffer;
-			index++;
-		}
-	}
-	mutex_unlock(&mm->buffer_mutex);
-
-	//unmap sg table and free phy memory
-	pr_info("free buffer count %d for CTRL + C\n", buffer_count);
-	for (index = 0; index < buffer_count; index++) {
-		list_for_each_entry_safe(block, tmp, &pbuf[index]->phy_blocks, list) {
-			if (block) {
-				list_del(&block->list);
-				iommu_unmap(mm->iommu_domain, block->iova_start, block->size);
-				aipu_free_phy_block(mm, block);
-			}
-		}
-		aipu_free_iova(mm, pbuf[index]);
-	}
-
-	kfree(pbuf);
-
-	return 0;
-}
-
-
 /* ============================================================================
  * V3 Custom IOVA Domain Support
  * 
@@ -4251,11 +3977,7 @@ int aipu_mm_v3_init_iova_domain(struct aipu_memory_manager *mm)
 	total_iova_size = mm->iova_size;
 
 	/* Initialize IOVA domain */
-#if (KERNEL_VERSION(4, 15, 0) <= LINUX_VERSION_CODE)
 	init_iova_domain(&mm->iova_domain, PAGE_SIZE, 0);
-#else
-	init_iova_domain(&mm->iova_domain, PAGE_SIZE, 0, total_iova_size >> PAGE_SHIFT);
-#endif
 
 	/*
 	 * Reserve page 0 so IOVA 0x0 is never allocated.
@@ -4528,7 +4250,7 @@ struct aipu_iova_buffer *aipu_mm_v3_alloc_iova(struct aipu_memory_manager *mm,
 	buffer->data_type = buf_req->data_type;
 	buffer->ref_count = 1;
 	/*
-	 * [audit F-01] filp==NULL is reserved for the hold-TCB allocation path
+	 * filp==NULL is reserved for the hold-TCB allocation path
 	 * (aipu_mm_hold_tcb_buf_alloc -> aipu_mm_alloc(..., NULL) with
 	 * data_type == AIPU_MM_DATA_TYPE_TCB). Such a buffer is intentionally
 	 * cross-fd: the exit-encode tail is shared by every job's TCB chain,
@@ -4717,7 +4439,7 @@ int aipu_mm_v3_alloc_phy_and_map(struct aipu_memory_manager *mm,
 	block->va = vmap(block->pages, page_count, VM_MAP,
 			 pgprot_noncached(PAGE_KERNEL));
 	if (!block->va) {
-		/* [audit F-13] vmap failure must propagate as -ENOMEM.
+		/* vmap failure must propagate as -ENOMEM.
 		 * If a hold-TCB-class buffer ends up with kva == NULL,
 		 * a subsequent aipu_mm_link_tcb dereferences kva under
 		 * mm->shlock and OOPSes the kernel with a spinlock held.
@@ -5244,7 +4966,7 @@ void aipu_mm_v3_free_iova_buffer(struct aipu_memory_manager *mm,
  *
  * Called when fd is closed
  *
- * [audit F-01] Buffers with buffer->filp == NULL (hold-TCB cross-fd
+ * Buffers with buffer->filp == NULL (hold-TCB cross-fd
  * allocations from aipu_mm_hold_tcb_buf_alloc) are intentionally NOT
  * reclaimed here — they are module-lifetime and reclaimed in
  * aipu_mm_hold_tcb_buf_free at deinit. The filp != NULL guard at entry

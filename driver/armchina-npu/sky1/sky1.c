@@ -16,7 +16,6 @@
 #include <linux/scmi_protocol.h>
 #include <linux/debugfs.h>
 #include <linux/acpi.h>
-#include <linux/version.h>
 #include "armchina_aipu_soc.h"
 #include "cix_sky1_soc.h"
 
@@ -83,11 +82,7 @@ static int aipu_scmi_device_opp_table_parse(struct device *dev)
 
 	perf_ops = pd->perf_ops;
 	ph = pd->ph;
-#if (KERNEL_VERSION(6, 7, 0) <= LINUX_VERSION_CODE)
 	ret = perf_ops->device_opps_add(ph, dev, pd->domain_id);
-#else
-	ret = perf_ops->device_opps_add(ph, dev);
-#endif
 	if (ret) {
 		dev_err(dev, "failed to add opps to the device\n");
 		return ret;
@@ -149,7 +144,6 @@ static void remove_debugfs_dir(const char *name)
     dput(parent);
 }
 
-#ifdef CONFIG_ENABLE_DEVFREQ
 static int sky1_npu_devfreq_target(struct device *dev, unsigned long *freq, u32 flags)
 {
     struct dev_pm_opp *opp;
@@ -360,7 +354,6 @@ static int sky1_npu_devfreq_remove(struct device *dev, struct cix_aipu_priv *cix
 
     return 0;
 }
-#endif
 
 int sky1_npu_pm_runtime_get_sync(struct device *dev)
 {
@@ -384,13 +377,7 @@ int sky1_npu_pm_runtime_put(struct device *dev)
 #ifdef CONFIG_PM
 	int ret = 0;
 
-#if KERNEL_VERSION(7, 0, 0) > LINUX_VERSION_CODE
-	ret = pm_runtime_put(dev);
-	if (ret < 0)
-		dev_err(dev, "PM runtime put failed! ret=%d", ret);
-#else
 	pm_runtime_put(dev);
-#endif
 
 	return ret;
 #else /* !CONFIG_PM  */
@@ -554,13 +541,11 @@ static int sky1_npu_probe(struct platform_device *p_dev)
 		}
     }
 
-#ifdef CONFIG_ENABLE_DEVFREQ
 	ret = sky1_npu_devfreq_init(&p_dev->dev, cix_aipu_priv);
 	if (ret) {
 		dev_err(&p_dev->dev, "aipu devfreq init failed, ret: %d\n", ret);
 		goto devfreq_init_failed;
 	}
-#endif
 
 #ifdef CONFIG_PM
 	pm_runtime_get_noresume(&p_dev->dev);
@@ -611,9 +596,7 @@ err_core_get:
 	pm_runtime_put_noidle(&p_dev->dev);
 #endif /* CONFIG_PM */
 
-#ifdef CONFIG_ENABLE_DEVFREQ
 	sky1_npu_devfreq_remove(&p_dev->dev, cix_aipu_priv);
-#endif
 
 devfreq_init_failed:
 	sky1_npu_teardown_cores(&p_dev->dev);
@@ -621,16 +604,10 @@ devfreq_init_failed:
 	return ret;
 }
 
-#if KERNEL_VERSION(6, 11, 0) > LINUX_VERSION_CODE
-static int sky1_npu_remove(struct platform_device *p_dev)
-#else
 static void sky1_npu_remove(struct platform_device *p_dev)
-#endif
 {
 	dev_dbg(&p_dev->dev, "%s \n", __func__);
-#ifdef CONFIG_ENABLE_DEVFREQ
 	sky1_npu_devfreq_remove(&p_dev->dev, cix_aipu_priv);
-#endif
 
 	armchina_aipu_remove(p_dev);
 
@@ -639,10 +616,6 @@ static void sky1_npu_remove(struct platform_device *p_dev)
 #ifdef CONFIG_PM
 	pm_runtime_disable(&p_dev->dev);
 #endif /* CONFIG_PM */
-
-#if KERNEL_VERSION(6, 11, 0) > LINUX_VERSION_CODE
-	return 0;
-#endif
 }
 
 #ifdef CONFIG_PM
@@ -661,15 +634,7 @@ static int sky1_npu_runtime_suspend(struct device *dev)
 
 	if (has_acpi_companion(dev)) {
 		for (int i = 0; i < CIX_NPU_PD_NUM; i++) {
-#if KERNEL_VERSION(7, 0, 0) > LINUX_VERSION_CODE
-			ret = pm_runtime_put(cix_aipu_priv->pd_core[i]);
-			if (ret < 0) {
-				dev_err(cix_aipu_priv->pd_core[i], "NPU core PM runtime put failed! ret=%d", ret);
-				return ret;
-			}
-#else
 			pm_runtime_put(cix_aipu_priv->pd_core[i]);
-#endif
 		}
 	}
 

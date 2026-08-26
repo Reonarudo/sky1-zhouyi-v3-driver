@@ -392,7 +392,6 @@ static void zhouyi_v3_bottom_half(void *data)
 	aipu_job_manager_irq_bottom_half(data);
 }
 
-#ifdef CONFIG_SYSFS
 static int zhouyi_v3_sysfs_show(struct aipu_partition *partition, char *buf)
 {
 	int ret = 0;
@@ -470,7 +469,6 @@ static int zhouyi_v3_sysfs_show(struct aipu_partition *partition, char *buf)
 
 	return ret;
 }
-#endif
 
 static int zhouyi_v3_soft_reset(struct aipu_partition *partition, bool init_regs)
 {
@@ -504,9 +502,7 @@ static struct aipu_operations zhouyi_v3_ops = {
 	.io_rw = zhouyi_v3_io_rw,
 	.upper_half = zhouyi_v3_upper_half,
 	.bottom_half = zhouyi_v3_bottom_half,
-#ifdef CONFIG_SYSFS
 	.sysfs_show = zhouyi_v3_sysfs_show,
-#endif
 	.soft_reset = zhouyi_v3_soft_reset,
 	.initialize = zhouyi_v3_initialize,
 	.destroy_command_pool = zhouyi_v3_destroy_command_pool,

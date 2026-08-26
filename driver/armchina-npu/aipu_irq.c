@@ -4,7 +4,6 @@
 #include <linux/slab.h>
 #include <linux/interrupt.h>
 #include <linux/irqreturn.h>
-#include <linux/version.h>
 #include "aipu_irq.h"
 #include "aipu_partition.h"
 #include "aipu_priv.h"
@@ -69,11 +68,7 @@ struct aipu_irq_object *aipu_create_irq_object(struct device *dev, u32 irqnum, v
 	 * Remove it if you have no such a usage scenario.
 	 */
 	ret = request_irq(irqnum, aipu_irq_handler_upper_half,
-#if KERNEL_VERSION(7, 0, 0) > LINUX_VERSION_CODE
-			  IRQF_ONESHOT | IRQF_SHARED | IRQF_PROBE_SHARED,
-#else
 			  IRQF_SHARED | IRQF_PROBE_SHARED,
-#endif
 			  description, irq_obj->dev);
 	if (ret) {
 		dev_err(dev, "request_irq failed: irqnum %u, ret %d", irqnum, ret);
