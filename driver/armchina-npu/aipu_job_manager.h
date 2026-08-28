@@ -61,6 +61,23 @@ struct job_irq_info {
 };
 
 /**
+ * struct aipu_printf_sig - a printf signal captured in the IRQ upper half (v3)
+ * @tail_tcbp: TCBP of the TCB that raised the printf signal
+ * @sig_flag:  signal flag it was raised with
+ *
+ * resolving the printf buffer (IOVA -> VA) takes mm's mutexes,
+ * so it cannot run in hard-IRQ context; the upper half captures the
+ * two registers the resolution needs and the bottom half does the walk and
+ * the printing.
+ */
+struct aipu_printf_sig {
+	u32 tail_tcbp;
+	u32 sig_flag;
+};
+
+#define AIPU_PRINTF_SIG_MAX 16
+
+/**
  * struct profiler - maintain profiling data information (v3)
  * @data: pointer to the profiling data
  * @size: size of the data
@@ -212,8 +229,8 @@ struct aipu_job_manager {
 int init_aipu_job_manager(struct aipu_job_manager *manager, struct aipu_memory_manager *mm,
 			  void *priv);
 void deinit_aipu_job_manager(struct aipu_job_manager *manager);
-void aipu_job_manager_set_partitions_info(struct aipu_job_manager *manager, int partition_cnt,
-					  struct aipu_partition *partitions);
+int aipu_job_manager_set_partitions_info(struct aipu_job_manager *manager, int partition_cnt,
+					 struct aipu_partition *partitions);
 int aipu_job_manager_scheduler(struct aipu_job_manager *manager, struct aipu_job_desc *user_job,
 			       struct file *filp);
 void aipu_job_manager_irq_upper_half(struct aipu_partition *core, int exception_flag,

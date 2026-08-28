@@ -8,6 +8,7 @@
 #include <linux/device.h>
 #include <linux/sysfs.h>
 #include <linux/atomic.h>
+#include <linux/irqreturn.h>
 #include <armchina_aipu.h>
 #include "aipu_irq.h"
 #include "aipu_io.h"
@@ -30,7 +31,8 @@ struct aipu_priv;
  * @io_rw:              direct IO read/write operations
  * @upper_half:         interrupt upper half handler
  * @bottom_half:        interrupt bottom half handler
- * @sysfs_show:         show AIPU external register values
+ * @sysfs_show:         append AIPU external register values at @len of the
+ *                      sysfs page @buf; returns the byte count appended
  * @soft_reset:         AIPU core/partition soft reset function
  * @initialize:         initialize AIPU core/partition after soft reset
  * @destroy_command_pool: destroy command pools of this partition
@@ -50,9 +52,14 @@ struct aipu_operations {
 	bool (*is_idle)(struct aipu_partition *aipu);
 	void (*print_hw_id_info)(struct aipu_partition *aipu);
 	int (*io_rw)(struct aipu_partition *aipu, struct aipu_io_req *io_req);
-	int (*upper_half)(void *data);
+	/*
+	 * the IRQ is IRQF_SHARED: the handler must report
+	 * IRQ_NONE for interrupts that were not this device's, or the
+	 * kernel's spurious-interrupt detection is defeated.
+	 */
+	irqreturn_t (*upper_half)(void *data);
 	void (*bottom_half)(void *data);
-	int (*sysfs_show)(struct aipu_partition *aipu, char *buf);
+	int (*sysfs_show)(struct aipu_partition *aipu, char *buf, int len);
 	int (*soft_reset)(struct aipu_partition *aipu, bool init_regs);
 	void (*initialize)(struct aipu_partition *aipu);
 	int (*destroy_command_pool)(struct aipu_partition *partition, int pool);
@@ -93,8 +100,6 @@ struct cluster_info {
  * @irq_obj:         interrupt object of this core
  * @priv:            pointer to aipu private struct
  * @reg_attr:        external register attribute
- * @clk_attr:        clock attribute
- * @disable_attr:    disable core attribute
  * @disable:         core disable flag (for debug usage)
  * @is_init:         init flag
  * @reset_lock:      soft reset mutex
@@ -119,8 +124,6 @@ struct aipu_partition {
 	struct aipu_irq_object *irq_obj;
 	struct aipu_priv *priv;
 	struct device_attribute *reg_attr;
-	struct device_attribute *clk_attr;
-	struct device_attribute *disable_attr;
 	atomic_t disable;
 	int is_init;
 	struct mutex reset_lock; /* Protect soft reset */
@@ -132,7 +135,6 @@ struct aipu_partition {
 	int partition_mode;
 	int event_type;
 	struct mutex page_lock; /* protect page selection process */
-	struct io_region *dbg_reg;
 };
 
 /**

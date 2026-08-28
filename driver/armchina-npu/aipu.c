@@ -29,10 +29,25 @@ static struct aipu_priv *aipu;
 
 static int aipu_open(struct inode *inode, struct file *filp)
 {
+#ifdef CONFIG_SKY1
+	int ret;
+#endif
+
 	filp->private_data = aipu;
 
 #ifdef CONFIG_SKY1
-	sky1_npu_pm_runtime_get_sync(aipu->dev);
+	/*
+	 * the fd holds the NPU's only runtime-PM reference, so a
+	 * failed resume must fail open() -- otherwise the next REQ_IO or job
+	 * dispatch reads MMIO on power domains that never came up. get_sync
+	 * increments even on error, so drop that
+	 * reference before failing.
+	 */
+	ret = sky1_npu_pm_runtime_get_sync(aipu->dev);
+	if (ret < 0) {
+		pm_runtime_put_noidle(aipu->dev);
+		return ret;
+	}
 #endif
 
 	return aipu_priv_check_status(aipu);
@@ -42,6 +57,10 @@ static int aipu_release(struct inode *inode, struct file *filp)
 {
 	struct aipu_priv *aipu = filp->private_data;
 	int ret;
+
+	/* defensive guard from upstream 4.3.0 (2868d53) */
+	if (!aipu)
+		return -EINVAL;
 
 	/*
 	 * release() is the fd-close path; VFS ignores our return value, so
@@ -101,6 +120,15 @@ static long aipu_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 
 	struct aipu_rebind_buf_desc rebind_buf;
 
+	/*
+	 * misc_deregister() does not revoke fds that are already
+	 * open, and unbind (unlike rmmod) is not blocked by fops .owner --
+	 * without this gate such an fd could ioctl into a torn-down driver.
+	 * is_init clears before any teardown starts (deinit_aipu_priv).
+	 */
+	if (aipu_priv_check_status(aipu))
+		return -ENODEV;
+
 	switch (cmd) {
 	case AIPU_IOCTL_QUERY_CAP:
 		ret = aipu_priv_query_capability(aipu, &cap);
@@ -152,10 +180,13 @@ static long aipu_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			ret = -EINVAL;
 		break;
 	case AIPU_IOCTL_DISABLE_SRAM:
-		ret = aipu_mm_disable_sram_allocation(&aipu->mm, filp);
-		break;
 	case AIPU_IOCTL_ENABLE_SRAM:
-		ret = aipu_mm_enable_sram_allocation(&aipu->mm, filp);
+		/*
+		 * the SRAM allocator these toggled was deleted as
+		 * dead weight; they have refused with -EINVAL on this hardware
+		 * since the reserved-region count was always 0.
+		 */
+		ret = -EINVAL;
 		break;
 	case AIPU_IOCTL_SCHEDULE_JOB:
 		if (!copy_from_user(&user_job, (struct user_job_desc __user *)arg,
@@ -172,6 +203,8 @@ static long aipu_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			    copy_to_user((struct job_status_query __user *)arg, &status,
 					 sizeof(status)))
 				ret = -EINVAL;
+		} else {
+			ret = -EINVAL;
 		}
 		break;
 	case AIPU_IOCTL_KILL_TIMEOUT_JOB:
@@ -255,12 +288,22 @@ static long aipu_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			ret = -EINVAL;
 		break;
 	case AIPU_IOCTL_GET_DRIVER_VERSION:
-		ret = copy_to_user((char __user *)arg, KMD_VERSION, sizeof(KMD_VERSION));
+		/*
+		 * copy_to_user returns the uncopied byte count, a
+		 * positive "success" through glibc's ioctl -- map it to an
+		 * errno here and below.
+		 */
+		if (copy_to_user((char __user *)arg, KMD_VERSION, sizeof(KMD_VERSION)))
+			ret = -EFAULT;
 		break;
 	case AIPU_IOCTL_ALLOC_GRID_ID:
 		ret = aipu_job_manager_alloc_grid_id(manager);
-		if (ret >= 0)
-			ret = copy_to_user((char __user *)arg, &ret, sizeof(ret));
+		if (ret >= 0) {
+			if (copy_to_user((char __user *)arg, &ret, sizeof(ret)))
+				ret = -EFAULT;
+			else
+				ret = 0;
+		}
 		break;
 	case AIPU_IOCTL_ALLOC_GROUP_ID:
 		if (!copy_from_user(&id_desc, (struct aipu_id_desc __user *)arg,
@@ -339,13 +382,13 @@ static long aipu_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		break;
 	case AIPU_IOCTL_BUF_CACHE_INVALID:
 		if (!copy_from_user(&desc, (struct buf_desc __user *)arg, sizeof(desc)))
-			ret = aipu_mm_cache_invalid(&aipu->mm, &desc);
+			ret = aipu_mm_cache_invalid(&aipu->mm, &desc, filp);
 		else
 			ret = -EINVAL;
 		break;
 	case AIPU_IOCTL_BUF_CACHE_FLUSH:
 		if (!copy_from_user(&desc, (struct buf_desc __user *)arg, sizeof(desc)))
-			ret = aipu_mm_cache_flush(&aipu->mm, &desc);
+			ret = aipu_mm_cache_flush(&aipu->mm, &desc, filp);
 		else
 			ret = -EINVAL;
 		break;
@@ -387,11 +430,6 @@ static const struct file_operations aipu_fops = {
 /**
  * @armchina_aipu_probe() - probe operation for platfom driver provided by ArmChina
  * @p_dev: pointer to the AIPU platform device struct.
- * @soc:   pointer to aipu SoC struct contains soc specific data.
- *         this argument can be NULL if SoC vendor has no AIPU related soc data structure.
- * @ops:   pointer to aipu SoC operation struct.
- *         this argument can be NULL if SoC vendor does not provide any soc operation. In
- *         this case the SoC related operations in AIPU driver are unavailable.
  *
  * This function should be called in a SoC vendor provided xx_aipu_probe() function,
  * which is registered to the platfom_driver struct; if no such xx_aipu_probe() is provided,
@@ -399,8 +437,7 @@ static const struct file_operations aipu_fops = {
  *
  * Return: 0 on success and error code otherwise.
  */
-int armchina_aipu_probe(struct platform_device *p_dev, struct aipu_soc *soc,
-			struct aipu_soc_operations *ops)
+int armchina_aipu_probe(struct platform_device *p_dev)
 {
 	int ret = 0;
 	struct device *dev = &p_dev->dev;
@@ -415,19 +452,41 @@ int armchina_aipu_probe(struct platform_device *p_dev, struct aipu_soc *soc,
 
 		dev_info(dev, "AIPU KMD (v%s) probe start...\n", KMD_VERSION);
 
-		platform_set_drvdata(p_dev, aipu);
-
-		ret = init_aipu_priv(aipu, p_dev, &aipu_fops, soc, ops);
-		if (ret)
+		ret = init_aipu_priv(aipu, p_dev, &aipu_fops);
+		if (ret) {
+			/*
+			 * the devm allocation dies with this
+			 * failed probe; keeping the global would hand the
+			 * next bind freed memory.
+			 */
+			aipu = NULL;
 			return ret;
+		}
 	}
+
+	/*
+	 * outside the !aipu block: sky1_npu_probe() stores its own
+	 * struct in drvdata before calling here, and every consumer
+	 * (sysfs handlers, core-count update) reads the slot as aipu_priv.
+	 */
+	platform_set_drvdata(p_dev, aipu);
 
 	device_property_read_u32(dev, "core-id", &id);
 
-	WARN_ON(!aipu->ops);
-	partition = aipu->ops->create_partitions(aipu, id, p_dev);
-	if (IS_ERR(partition))
+	/*
+	 * a guard instead of the WARN_ON, per upstream 4.3.0 --
+	 * but failing where upstream silently skips creation and returns
+	 * success with no /dev/aipu behind it.
+	 */
+	if (!aipu->ops) {
+		ret = -EINVAL;
 		goto out_clean;
+	}
+	partition = aipu->ops->create_partitions(aipu, id, p_dev);
+	if (IS_ERR(partition)) {
+		ret = PTR_ERR(partition);
+		goto out_clean;
+	}
 
 	goto finish;
 
@@ -451,9 +510,21 @@ EXPORT_SYMBOL(armchina_aipu_probe);
  */
 int armchina_aipu_remove(struct platform_device *p_dev)
 {
-	if (!aipu || !aipu->is_init)
+	struct aipu_priv *priv = aipu;
+
+	/*
+	 * the aipu_priv is devm memory: it is freed when this
+	 * unbind completes. A stale global made a re-bind skip the !aipu
+	 * branch in probe entirely -- no init_aipu_priv(), no
+	 * platform_set_drvdata() -- so the job manager dereferenced its
+	 * freed partitions (the config_clusters+0x94 kdump) and every
+	 * drvdata consumer type-confused sky1's private struct.
+	 */
+	aipu = NULL;
+
+	if (!priv || !priv->is_init)
 		return 0;
-	return deinit_aipu_priv(aipu);
+	return deinit_aipu_priv(priv);
 }
 EXPORT_SYMBOL(armchina_aipu_remove);
 
@@ -468,20 +539,15 @@ EXPORT_SYMBOL(armchina_aipu_remove);
  */
 int armchina_aipu_suspend(struct platform_device *p_dev, pm_message_t state)
 {
-	int ret = 0;
-	struct aipu_job_manager *manager = get_job_manager(aipu->partitions);
+	/* aipu was dereferenced before the test below */
+	struct aipu_job_manager *manager = aipu ? get_job_manager(aipu->partitions) : NULL;
 
 	if (!manager) {
-		pr_err("susppend: npu driver is not ready.\n");
+		pr_err("suspend: npu driver is not ready.\n");
 		return 0;
 	}
 
-	ret = aipu_job_manager_suspend(get_job_manager(aipu->partitions));
-
-	if (ret == 0 && aipu && aipu->soc_ops && aipu->soc_ops->disable_clk)
-		aipu->soc_ops->disable_clk(aipu->partitions->dev, aipu->soc);
-
-	return ret;
+	return aipu_job_manager_suspend(manager);
 }
 EXPORT_SYMBOL(armchina_aipu_suspend);
 
@@ -496,20 +562,15 @@ EXPORT_SYMBOL(armchina_aipu_suspend);
  */
 int armchina_aipu_resume(struct platform_device *p_dev)
 {
-	int ret = 0;
-	struct aipu_job_manager *manager = get_job_manager(aipu->partitions);
+	/* aipu was dereferenced before the test below */
+	struct aipu_job_manager *manager = aipu ? get_job_manager(aipu->partitions) : NULL;
 
 	if (!manager) {
 		pr_err("resume: npu driver is not ready.\n");
 		return 0;
 	}
 
-	ret = aipu_job_manager_resume(get_job_manager(aipu->partitions));
-
-	if (ret == 0 && aipu && aipu->soc_ops && aipu->soc_ops->enable_clk)
-		aipu->soc_ops->enable_clk(aipu->partitions->dev, aipu->soc);
-
-	return ret;
+	return aipu_job_manager_resume(manager);
 }
 EXPORT_SYMBOL(armchina_aipu_resume);
 

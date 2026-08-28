@@ -5,10 +5,6 @@
 #include <asm/cacheflush.h>
 #include <linux/mm.h>
 #include <linux/of.h>
-#include <linux/of_device.h>
-#include <linux/of_address.h>
-#include <linux/of_reserved_mem.h>
-#include <linux/of_iommu.h>
 #include <linux/dma-mapping.h>
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
@@ -23,431 +19,10 @@
 #include "aipu_common.h"
 #include "aipu_dma_buf.h"
 
-/*
- * DEBUG: V3 custom-IOVA lifecycle tracing (DPTSW-23453 SMMU event 0x10).
- * The V3_IOVA_DEBUG toggle and the v3dbg() macro now live in aipu_mm.h so
- * aipu_job_manager.c can share them. Logs ALLOC_IOVA/MAP/UNMAP/FREE here and
- * job dispatch / hold-TCB chain in the job manager. grep dmesg for "V3IOVA".
- *
- * aipu_mm_v3_dbg_iova_phys(): returns the backing phys for @iova, or 0 if the
- * IOVA is not currently mapped -- lets the job manager tell whether a TCB the
- * command pool is about to walk still has a live IOMMU mapping.
- */
-phys_addr_t aipu_mm_v3_dbg_iova_phys(struct aipu_memory_manager *mm, u64 iova)
-{
-#if V3_IOVA_DEBUG
-	if (!mm || !mm->iommu_domain || !mm->use_v3_custom_iova)
-		return 0;
-	return iommu_iova_to_phys(mm->iommu_domain, iova);
-#else
-	return 0;
-#endif
-}
-
-#if V3_IOVA_DEBUG
-/* DEBUG: short name for an aipu_mm_data_type value (see armchina_aipu.h). */
-static const char *aipu_mm_v3_dtype_str(u32 dt)
-{
-	static const char * const names[] = {
-		"NONE", "TEXT", "RODATA", "STACK",
-		"STATIC", "REUSE", "TCB", "WEIGHT"
-	};
-
-	return dt < ARRAY_SIZE(names) ? names[dt] : "?";
-}
-#endif
-
-/*
- * DEBUG: translate a custom-path IOVA to the kernel VA that backs it (each
- * physical block is vmap()'d at alloc time).  Must run in process context --
- * it takes buffer_mutex/phy_mutex -- so callers in atomic context (e.g. the
- * job-manager dispatch spinlock) must defer to after unlock.
- */
-void *aipu_mm_v3_dbg_iova_to_va(struct aipu_memory_manager *mm, u64 iova)
-{
-#if V3_IOVA_DEBUG
-	struct aipu_iova_buffer *buffer;
-	struct aipu_phy_block *block;
-	void *va = NULL;
-
-	if (!mm || !mm->use_v3_custom_iova)
-		return NULL;
-
-	mutex_lock(&mm->buffer_mutex);
-	list_for_each_entry(buffer, &mm->buffer_list, node) {
-		if (iova < buffer->iova_start ||
-		    iova >= buffer->iova_start + buffer->iova_size)
-			continue;
-
-		mutex_lock(&buffer->phy_mutex);
-		list_for_each_entry(block, &buffer->phy_blocks, list) {
-			if (block->va && iova >= block->iova_start &&
-			    iova < block->iova_start + block->size) {
-				va = (u8 *)block->va + (iova - block->iova_start);
-				break;
-			}
-		}
-		mutex_unlock(&buffer->phy_mutex);
-		break;
-	}
-	mutex_unlock(&mm->buffer_mutex);
-	return va;
-#else
-	return NULL;
-#endif
-}
-
-/*
- * DEBUG: dump the pointer fields of a TCB and whether each is currently mapped.
- * The data-pointer fields (sp/pp/dp/cp/...) are 32-bit ASID-relative offsets;
- * we treat them as ASID-0 IOVAs for the mapped check, which is correct for the
- * demo (all buffers land in ASID 0).  A field that equals the faulting address
- * with m0 is the stale/dangling pointer.  Must run in process context.
- */
-void aipu_mm_v3_dbg_dump_tcb(struct aipu_memory_manager *mm, u64 tcb_pa,
-			     const char *tag)
-{
-#if V3_IOVA_DEBUG
-	struct aipu_tcb *tcb;
-	void *va;
-
-	if (!mm || !mm->use_v3_custom_iova || !tcb_pa)
-		return;
-
-	va = aipu_mm_v3_dbg_iova_to_va(mm, tcb_pa);
-	if (!va) {
-		v3dbg(mm, "TCBDUMP %-4s pa=0x%llx <no kernel VA / unmapped>\n",
-		      tag, tcb_pa);
-		return;
-	}
-
-	tcb = (struct aipu_tcb *)va;
-	if (IS_TASK_TCB(tcb->flag)) {
-		v3dbg(mm, "TCBDUMP %-4s pa=0x%llx TASK flag=0x%x sp=0x%x(m%d) pp=0x%x(m%d) dp=0x%x(m%d) cp=0x%x(m%d) tcbp=0x%x(m%d)\n",
-		      tag, tcb_pa, tcb->flag,
-		      tcb->task.sp, !!aipu_mm_v3_dbg_iova_phys(mm, tcb->task.sp),
-		      tcb->task.pp, !!aipu_mm_v3_dbg_iova_phys(mm, tcb->task.pp),
-		      tcb->task.dp, !!aipu_mm_v3_dbg_iova_phys(mm, tcb->task.dp),
-		      tcb->task.cp, !!aipu_mm_v3_dbg_iova_phys(mm, tcb->task.cp),
-		      tcb->task.tcbp,
-		      !!aipu_mm_v3_dbg_iova_phys(mm, tcb->task.tcbp));
-		v3dbg(mm, "TCBDUMP %-4s      fmdp=0x%x(m%d) tap=0x%x(m%d) dap=0x%x(m%d) pap=0x%x(m%d) idp=0x%x(m%d) pprint=0x%x pprof=0x%x gp=0x%x\n",
-		      tag,
-		      tcb->task.fmdp, !!aipu_mm_v3_dbg_iova_phys(mm, tcb->task.fmdp),
-		      tcb->task.tap, !!aipu_mm_v3_dbg_iova_phys(mm, tcb->task.tap),
-		      tcb->task.dap, !!aipu_mm_v3_dbg_iova_phys(mm, tcb->task.dap),
-		      tcb->task.pap, !!aipu_mm_v3_dbg_iova_phys(mm, tcb->task.pap),
-		      tcb->task.idp, !!aipu_mm_v3_dbg_iova_phys(mm, tcb->task.idp),
-		      tcb->task.pprint, tcb->task.pprofiler,
-		      tcb->task.global_param);
-	} else {
-		v3dbg(mm, "TCBDUMP %-4s pa=0x%llx INIT/GRID flag=0x%x asid0=0x%llx asid1=0x%llx asid2=0x%llx asid3=0x%llx\n",
-		      tag, tcb_pa, tcb->flag,
-		      tcb->grid.asids[0].v64, tcb->grid.asids[1].v64,
-		      tcb->grid.asids[2].v64, tcb->grid.asids[3].v64);
-	}
-#endif
-}
-
-/*
- * DEBUG: walk the whole TCB chain (head .. ltsk) following tcb->next, and for
- * every non-INIT TCB report any pointer field that is nonzero AND currently
- * unmapped (m0) -- that is the stale/dangling address the NPU faults on. Only
- * offending TCBs are printed, plus a one-line summary, to bound dmesg volume.
- * Walk is via tcb->next (a base-0 ASID-0 IOVA). Process context only.
- */
-void aipu_mm_v3_dbg_dump_tcb_chain(struct aipu_memory_manager *mm, u64 head_pa,
-				   u64 ltsk_pa, const char *tag)
-{
-#if V3_IOVA_DEBUG
-	const u32 max_walk = 8192;
-	u32 i, dangle_tcbs = 0, dangle_fields = 0;
-	u64 pa = head_pa;
-
-	if (!mm || !mm->use_v3_custom_iova || !head_pa)
-		return;
-
-	for (i = 0; i < max_walk && pa; i++) {
-		struct aipu_tcb *tcb = aipu_mm_v3_dbg_iova_to_va(mm, pa);
-		u64 next;
-
-		if (!tcb) {
-			v3dbg(mm, "CHAINWALK %-4s #%u pa=0x%llx <unmapped TCB - stop>\n",
-			      tag, i, pa);
-			break;
-		}
-
-		if (!IS_INIT_TCB(tcb->flag)) {
-			char b[224];
-			int n = 0;
-
-#define CHK(f) do { \
-	u32 _v = tcb->task.f; \
-	if (_v && !aipu_mm_v3_dbg_iova_phys(mm, _v)) { \
-		n += scnprintf(b + n, sizeof(b) - n, " " #f "=0x%x", _v); \
-		dangle_fields++; \
-	} \
-} while (0)
-			CHK(sp); CHK(pp); CHK(dp); CHK(cp);
-			CHK(fmdp); CHK(tap); CHK(dap); CHK(pap);
-			CHK(idp); CHK(pprint); CHK(pprofiler);
-			CHK(global_param);
-#undef CHK
-			if (n) {
-				dangle_tcbs++;
-				v3dbg(mm, "CHAINWALK %-4s #%u pa=0x%llx flag=0x%x DANGLING:%s\n",
-				      tag, i, pa, tcb->flag, b);
-			}
-		}
-
-		if (pa == ltsk_pa || IS_GRID_END(tcb->flag))
-			break;
-
-		next = tcb->next;
-		if (!next || next == pa)
-			break;
-		pa = next;
-	}
-
-	v3dbg(mm, "CHAINWALK %-4s walked %u tcbs, %u dangling tcbs, %u dangling fields\n",
-	      tag, i, dangle_tcbs, dangle_fields);
-#endif
-}
-
-#if V3_IOVA_DEBUG
-/*
- * DEBUG: scan @max_bytes of the buffer at @iova for 32-bit words that look like
- * an ASID-0 IOVA [0x1000, 3GB) but are currently unmapped (m0) -- i.e. a stale
- * absolute pointer baked into the content. Page VA is fetched once per page.
- */
-static void aipu_mm_v3_dbg_scan_region(struct aipu_memory_manager *mm, u64 iova,
-				       u32 max_bytes, const char *tag,
-				       const char *field)
-{
-	u64 base = iova & ~((u64)PAGE_SIZE - 1);
-	const u32 max_hits = 8;
-	u32 poff, hits = 0;
-
-	for (poff = 0; poff < max_bytes && hits < max_hits; poff += PAGE_SIZE) {
-		u8 *pg = aipu_mm_v3_dbg_iova_to_va(mm, base + poff);
-		u32 w;
-
-		if (!pg)
-			break;	/* past end of this buffer's mapping */
-		for (w = 0; w + 4 <= PAGE_SIZE && hits < max_hits; w += 4) {
-			u32 v = *(u32 *)(pg + w);
-
-			/*
-			 * Only consider values in the high IOVA band where the
-			 * top-down allocator actually places buffers; this
-			 * filters out small constants/strides/packed fields that
-			 * merely look like a low IOVA.
-			 */
-			if (v >= 0x90000000 && v < 0xC0000000 &&
-			    !aipu_mm_v3_dbg_iova_phys(mm, v)) {
-				v3dbg(mm, "PTRSCAN %-4s %s base=0x%llx +0x%x = 0x%x (m0 dangling)\n",
-				      tag, field, base, poff + w, v);
-				hits++;
-			}
-		}
-	}
-}
-#endif
-
-void aipu_mm_v3_dbg_scan_task_ptrs(struct aipu_memory_manager *mm, u64 ftsk_pa,
-				   const char *tag)
-{
-#if V3_IOVA_DEBUG
-	const u32 win = 0x80000;	/* up to 512KB scan window per buffer */
-	struct aipu_tcb *tcb;
-
-	if (!mm || !mm->use_v3_custom_iova || !ftsk_pa)
-		return;
-
-	tcb = aipu_mm_v3_dbg_iova_to_va(mm, ftsk_pa);
-	if (!tcb || IS_INIT_TCB(tcb->flag))
-		return;
-
-	if (tcb->task.cp)
-		aipu_mm_v3_dbg_scan_region(mm, tcb->task.cp, win, tag, "cp");
-	if (tcb->task.pp)
-		aipu_mm_v3_dbg_scan_region(mm, tcb->task.pp, win, tag, "pp");
-	if (tcb->task.dp)
-		aipu_mm_v3_dbg_scan_region(mm, tcb->task.dp, win, tag, "dp");
-#endif
-}
-
-/*
- * DEBUG: scan EVERY mapped buffer's content for a 32-bit word that looks like a
- * PAGE-ALIGNED ASID-0 IOVA in the band the top-down allocator uses
- * [0x90000000, 3GB) but is NOT currently mapped -- i.e. a dangling/stale base
- * pointer the NPU will fault on. Page-agnostic on purpose: the faulting IOVA
- * moves between sessions (0xba780000 vs 0xb9fb2000) because it tracks the live
- * layout, so a hardcoded target page misses it. @page_base is ignored (ABI).
- *
- * Two filters keep the signal high:
- *   - page-aligned ((v & 0xfff)==0): a real base pointer is page-aligned;
- *     quantized-weight data that merely lands in the band is not, so this drops
- *     the flood of false positives seen with the unfiltered scan.
- *   - per-buffer hit cap: a single noisy buffer can't exhaust the global budget
- *     before the scan reaches cp/pp/rodata/the big reuse buffer.
- *
- * Reads via the cached linear mapping (page_address) so a multi-hundred-MB sweep
- * is fast; the owning buffer IOVA/dtype lets us correlate to its ALLOC_IOVA.
- * Process context (takes buffer/phy mutex; iova_to_phys takes no extra lock).
- */
-void aipu_mm_v3_dbg_scan_all_for(struct aipu_memory_manager *mm, u32 page_base,
-				 const char *tag)
-{
-#if V3_IOVA_DEBUG
-	struct aipu_iova_buffer *buffer;
-	struct aipu_phy_block *block;
-	const u32 max_hits = 128;
-	const u32 max_hits_per_buf = 8;
-	u32 hits = 0;
-	u32 exact_hits = 0;
-
-	(void)page_base;
-
-	if (!mm || !mm->use_v3_custom_iova)
-		return;
-
-	mutex_lock(&mm->buffer_mutex);
-	list_for_each_entry(buffer, &mm->buffer_list, node) {
-		u32 buf_hits = 0;
-
-		mutex_lock(&buffer->phy_mutex);
-		list_for_each_entry(block, &buffer->phy_blocks, list) {
-			u32 pi;
-
-			for (pi = 0; pi < block->page_count &&
-			     hits < max_hits && buf_hits < max_hits_per_buf;
-			     pi++) {
-				u32 *p = page_address(block->pages[pi]);
-				u32 w;
-
-				if (!p)
-					continue;
-				for (w = 0; w < PAGE_SIZE / 4; w++) {
-					u32 v = p[w];
-
-					/*
-					 * FREED-BASE scan: the NPU reaches the fault
-					 * addr via (base + runtime offset). The base
-					 * is one of the three freed load-time
-					 * intermediates' iova_start (yolox 150MB /
-					 * arcface 49MB / scrfd 36MB), stored as a
-					 * 32-bit word inside live content. A hit pins
-					 * the exact carrier buffer + offset that bakes
-					 * the base the NPU dereferences into the freed
-					 * hole. 0xba780244 = arcface_base(0xb781f000)
-					 * + 0x2961244 -- inside arcface's freed span.
-					 */
-					if (exact_hits < 256 &&
-					    (v == 0xb1265000u ||
-					     v == 0xb781f000u ||
-					     v == 0xb85b7000u)) {
-						v3dbg(mm, "FREEBASE   %s buf_iova=0x%llx blk=0x%llx dtype=%s(%u) off=0x%x val=0x%x\n",
-						      tag, buffer->iova_start,
-						      block->iova_start,
-						      aipu_mm_v3_dtype_str(buffer->data_type),
-						      buffer->data_type,
-						      (pi << PAGE_SHIFT) + (w << 2), v);
-						exact_hits++;
-					}
-
-					/*
-					 * Page-aligned, in the allocator's high
-					 * band, and currently unmapped: the
-					 * dangling base-pointer signature.
-					 */
-					if (v & 0xfff)
-						continue;
-					if (v < 0x90000000 || v >= 0xC0000000)
-						continue;
-					if (aipu_mm_v3_dbg_iova_phys(mm, v))
-						continue;
-
-					v3dbg(mm, "DANGLEPTR %s buf_iova=0x%llx blk=0x%llx dtype=%s(%u) off=0x%x val=0x%x (m0 unmapped)\n",
-					      tag, buffer->iova_start,
-					      block->iova_start,
-					      aipu_mm_v3_dtype_str(buffer->data_type),
-					      buffer->data_type,
-					      (pi << PAGE_SHIFT) + (w << 2), v);
-					if (++hits >= max_hits)
-						break;
-					if (++buf_hits >= max_hits_per_buf)
-						break;
-				}
-			}
-			if (hits >= max_hits || buf_hits >= max_hits_per_buf)
-				break;
-		}
-		mutex_unlock(&buffer->phy_mutex);
-		if (hits >= max_hits)
-			break;
-	}
-	mutex_unlock(&mm->buffer_mutex);
-
-	v3dbg(mm, "DANGLEPTR %s done: %u dangling pointer(s) found, %u freed-base hit(s) (0xb1265000/0xb781f000/0xb85b7000)\n",
-	      tag, hits, exact_hits);
-#endif
-}
-
-/*
- * DEBUG: raw u32 dump of a TCB header. The init/grid/group fields live in a
- * union (asids / gm_ctrl+gm_rgnx_addr / seg-mmu smmu_conf) so a typed dump can
- * misread them; the raw words let us spot a 0xba780-derived seg-mmu/GM base
- * regardless of the union variant. 8 words/line, @n_words capped at 32.
- */
-void aipu_mm_v3_dbg_dump_tcb_raw(struct aipu_memory_manager *mm, u64 tcb_pa,
-				 u32 n_words, const char *tag)
-{
-#if V3_IOVA_DEBUG
-	u32 *w;
-	u32 i;
-
-	if (!mm || !mm->use_v3_custom_iova || !tcb_pa)
-		return;
-
-	w = aipu_mm_v3_dbg_iova_to_va(mm, tcb_pa);
-	if (!w) {
-		v3dbg(mm, "TCBRAW %-4s pa=0x%llx <no kernel VA>\n", tag, tcb_pa);
-		return;
-	}
-
-	if (n_words > 32)
-		n_words = 32;
-
-	for (i = 0; i < n_words; i += 8)
-		v3dbg(mm, "TCBRAW %-4s pa=0x%llx +0x%02x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
-		      tag, tcb_pa, i << 2,
-		      w[i + 0], w[i + 1], w[i + 2], w[i + 3],
-		      w[i + 4], w[i + 5], w[i + 6], w[i + 7]);
-#endif
-}
-
 /* Forward declarations for V3 custom IOVA support */
 static int aipu_mm_v3_reserve_never_map_zones(struct aipu_memory_manager *mm);
 
 #define EXIT_ENCODE_BUF_SIZE (1024)
-#define IOVA_FREE  false
-#define IOVA_ALLOC true
-
-enum iommu_dma_cookie_type {
-	IOMMU_DMA_IOVA_COOKIE,
-	IOMMU_DMA_MSI_COOKIE,
-};
-
-/*
- * Partial redefinition of the kernel-private struct iommu_dma_cookie
- * (defined in drivers/iommu/dma-iommu.c). Only the iovad field is accessed
- * by this driver; it must be at offset 0 to match the kernel's layout.
- */
-struct iommu_dma_cookie {
-	struct iova_domain      iovad;
-};
-
 struct exporter_dma_buf {
 	void *vaddr;
 	dma_addr_t paddr;
@@ -466,39 +41,13 @@ static struct aipu_mem_region *aipu_mm_find_region(struct aipu_memory_manager *m
 							   u64 iova, char *log_str);
 static struct aipu_iova_buffer *aipu_mm_v3_find_buffer_by_iova(struct aipu_memory_manager *mm,
 							      u64 iova);
+static struct aipu_iova_buffer *aipu_mm_v3_find_owned_buffer_by_iova(struct aipu_memory_manager *mm,
+								     u64 iova, struct file *filp);
 static struct aipu_tcb_buf *aipu_mm_v3_find_tcb_buf_no_lock(struct aipu_memory_manager *mm,
 							    u64 pa);
 static int init_cache_ops(struct aipu_memory_manager *mm);
 static void aipu_debug_print_buffers(struct aipu_memory_manager *mm);
 static struct aipu_iova_buffer *aipu_get_iova_buffer(struct aipu_memory_manager *mm, u64 iova, char* str);
-static struct device *aipu_mm_create_child_dev(struct device *dev, u32 idx)
-{
-	struct device *child = NULL;
-
-	child = devm_kzalloc(dev, sizeof(*child), GFP_KERNEL);
-	if (!child)
-		return NULL;
-
-	device_initialize(child);
-	dev_set_name(child, "%s:%s%u", dev_name(dev), "reserved_", idx);
-	child->parent = dev;
-	child->coherent_dma_mask = dev->coherent_dma_mask;
-	child->dma_mask = dev->dma_mask;
-	child->dma_parms = devm_kzalloc(dev, sizeof(*child->dma_parms),
-					GFP_KERNEL);
-	child->bus = dev->bus;
-	if (!child->dma_parms)
-		goto err;
-
-	child->dma_range_map = dev->dma_range_map;
-
-	return child;
-
-err:
-	put_device(child);
-	return NULL;
-}
-
 int aipu_mm_hold_tcb_buf_alloc(struct aipu_memory_manager *mm, struct aipu_job *kern_job)
 {
 	struct aipu_hold_tcb_buf *htbuf = NULL;
@@ -691,9 +240,17 @@ int aipu_mm_hold_tcb_buf_alloc(struct aipu_memory_manager *mm, struct aipu_job *
 	return ret;
 
 VA_FAIL:
+	spin_lock_irqsave(&mm->shlock, flags);
+	if (malloc_flag == 1) {
+		list_del(&htbuf->node);
+		htbuf_head->nums--;
+	} else {
+		/* un-claim the reused buffer so the idle search finds it again */
+		htbuf->status = AIPU_MEM_HOLD_TYPE_IDLE;
+	}
+	spin_unlock_irqrestore(&mm->shlock, flags);
 	if (malloc_flag == 1) {
 		aipu_mm_free(mm, &buf.desc, NULL, true);
-		htbuf_head->nums--;
 		kmem_cache_free(mm->hold_tbuf_cache, htbuf);
 	}
 	return ret;
@@ -847,60 +404,6 @@ static struct aipu_tcb_buf *aipu_mm_find_tbuf_in_region_no_lock(struct aipu_memo
 	return NULL;
 }
 
-static struct aipu_tcb_buf *aipu_mm_find_tcb_buf_no_lock(struct aipu_memory_manager *mm, u64 iova,
-							 char *log_str)
-{
-	struct aipu_mem_region *reg = NULL;
-	struct aipu_tcb_buf *tbuf = NULL;
-
-	if (!mm)
-		return NULL;
-
-	/* V3 custom IOVA: search in the global V3 TCB buffer list */
-	if (mm->version == AIPU_ISA_VERSION_ZHOUYI_V3 && mm->use_v3_custom_iova) {
-		tbuf = aipu_mm_v3_find_tcb_buf_no_lock(mm, iova);
-		if (log_str && !tbuf)
-			dev_dbg(mm->dev, "[%s] V3: no TCB buffer at iova 0x%llx", log_str, iova);
-		return tbuf;
-	}
-
-	reg = aipu_mm_find_region_no_lock(mm, iova, "find_tcb");
-	if (!reg)
-		return NULL;
-
-	tbuf = aipu_mm_find_tbuf_in_region_no_lock(mm, reg, iova);
-	if (log_str && !tbuf)
-		dev_dbg(mm->dev, "[%s] no TCB buffer is found at iova 0x%llx", log_str, iova);
-
-	return tbuf;
-}
-
-static unsigned long pa_to_bitmap_no(struct aipu_memory_manager *mm, struct aipu_mem_region *reg,
-				     u64 pa)
-{
-	return (pa - reg->base_iova) >> PAGE_SHIFT;
-}
-
-static int aipu_mm_init_pages(struct aipu_memory_manager *mm, struct aipu_mem_region *reg)
-{
-	if (!mm || !reg)
-		return -EINVAL;
-
-	reg->count = reg->bytes >> PAGE_SHIFT;
-	reg->bitmap = devm_kzalloc(reg->dev,
-				   BITS_TO_LONGS(reg->count) * sizeof(long), GFP_KERNEL);
-	if (!reg->bitmap)
-		return -ENOMEM;
-
-	reg->pages = vzalloc(reg->count * sizeof(struct aipu_virt_page *));
-	if (!reg->pages)
-		return -ENOMEM;
-
-	reg->base_pfn = PFN_DOWN(reg->base_iova);
-
-	return 0;
-}
-
 static void aipu_mm_destroy_region(struct aipu_memory_manager *mm, struct aipu_mem_region *reg)
 {
 	struct aipu_tcb_buf *tbuf = NULL;
@@ -914,22 +417,6 @@ static void aipu_mm_destroy_region(struct aipu_memory_manager *mm, struct aipu_m
 		dma_free_attrs(reg->dev, reg->bytes, reg->base_va, reg->base_pa, reg->attrs);
 		reg->base_va = NULL;
 		reg->base_iova = 0;
-	}
-
-	if (reg->reserved) {
-		of_reserved_mem_device_release(reg->dev);
-		reg->base_pa = 0;
-	}
-
-	if (reg->pages) {
-		vfree(reg->pages);
-		reg->pages = NULL;
-		reg->count = 0;
-	}
-
-	if (reg->bitmap) {
-		devm_kfree(reg->dev, reg->bitmap);
-		reg->bitmap = NULL;
 	}
 
 	if (reg->tcb_buf_head) {
@@ -947,8 +434,7 @@ static void aipu_mm_destroy_region(struct aipu_memory_manager *mm, struct aipu_m
 static struct aipu_mem_region *aipu_mm_create_region(struct aipu_memory_manager *mm,
 						     struct aipu_mem_region_obj *obj,
 						     enum aipu_mem_region_type type,
-						     u64 size, u64 offset, u32 idx,
-						     bool reserved)
+						     u64 size)
 {
 	int ret = 0;
 	void *va = NULL;
@@ -963,18 +449,8 @@ static struct aipu_mem_region *aipu_mm_create_region(struct aipu_memory_manager 
 
 	reg->type = type;
 	reg->bytes = size;
-	reg->host_aipu_offset = offset;
-	reg->reserved = reserved;
 	reg->obj = obj;
-
-	/* we use child dev to support multiple reserved regions */
-	if (reserved && !mm->has_iommu)
-		reg->dev = aipu_mm_create_child_dev(mm->dev, idx);
-	else
-		reg->dev = mm->dev;
-
-	if (!reg->dev)
-		goto err;
+	reg->dev = mm->dev;
 
 	/* only head of the list is created; for v3; */
 	reg->tcb_buf_head = create_tcb_buf(mm, reg);
@@ -985,47 +461,23 @@ static struct aipu_mem_region *aipu_mm_create_region(struct aipu_memory_manager 
 	if (!size)
 		return reg;
 
-	if (reserved && !mm->has_iommu) {
-		ret = of_reserved_mem_device_init_by_idx(reg->dev, mm->dev->of_node, idx);
-		if (ret) {
-			dev_err(reg->dev, "init reserved mem failed: idx %d (%d)\n",
-				idx, ret);
-			goto err;
-		}
-	}
-
 	if (mm->has_iommu) {
 		ret = dma_set_mask_and_coherent(mm->dev, DMA_BIT_MASK(mm->dma_mask));
 		if (ret) {
-			dev_err(reg->dev, "DMA set coherent mask failed: idx %d (%d)!\n", idx, ret);
+			dev_err(reg->dev, "DMA set coherent mask failed (%d)!\n", ret);
 			goto err;
 		}
 	}
 
 	va = dma_alloc_attrs(reg->dev, reg->bytes, &reg->base_pa, GFP_KERNEL, reg->attrs);
 	if (!va) {
-		dev_err(reg->dev, "dma_alloc_attrs failed: idx %d (bytes: 0x%llx, attrs %ld)\n",
-			idx, reg->bytes, reg->attrs);
+		dev_err(reg->dev, "dma_alloc_attrs failed (bytes: 0x%llx, attrs %ld)\n",
+			reg->bytes, reg->attrs);
 		goto err;
 	}
-	reg->base_iova = reg->base_pa - reg->host_aipu_offset;
+	reg->base_iova = reg->base_pa;
 	reg->base_va = va;
 
-	/* reserve memory region use page structs to maintain the allocations in this reg */
-	if (reserved) {
-		ret = aipu_mm_init_pages(mm, reg);
-		if (ret)
-			goto err;
-
-		dev_info(reg->dev, "init %s region done: %s [0x%llx, 0x%llx]\n",
-			 type == AIPU_MEM_REGION_TYPE_MEMORY ? "MEMORY" :
-			 (type == AIPU_MEM_REGION_TYPE_SRAM ? "SRAM" :
-			  (type == AIPU_MEM_REGION_TYPE_DTCM ? "DTCM" : "GM")),
-			 mm->has_iommu ? "iova" : "pa",
-			 reg->base_iova, reg->base_iova + reg->bytes - 1);
-	}
-
-	/* works for non-reserved regions only */
 	reg->locked = true;
 	return reg;
 
@@ -1036,8 +488,7 @@ err:
 
 static struct aipu_mem_region_obj *aipu_mm_create_region_object(struct aipu_memory_manager *mm,
 								enum aipu_mem_region_type type,
-								u64 size, u64 offset, u32 idx,
-								struct file *filp, bool reserved)
+								u64 size, struct file *filp)
 {
 	struct aipu_mem_region_obj *obj = NULL;
 
@@ -1045,7 +496,7 @@ static struct aipu_mem_region_obj *aipu_mm_create_region_object(struct aipu_memo
 	if (!obj)
 		return NULL;
 
-	obj->reg = aipu_mm_create_region(mm, obj, type, size, offset, idx, reserved);
+	obj->reg = aipu_mm_create_region(mm, obj, type, size);
 	if (!obj->reg) {
 		kmem_cache_free(mm->obj_cache, obj);
 		return NULL;
@@ -1072,27 +523,12 @@ static int init_region_list(struct aipu_memory_manager *mm, struct aipu_mem_regi
 {
 	struct aipu_mem_region_obj *obj = NULL;
 
-	obj = aipu_mm_create_region_object(mm, AIPU_MEM_REGION_TYPE_MEMORY, 0, 0, 0, NULL, false);
+	obj = aipu_mm_create_region_object(mm, AIPU_MEM_REGION_TYPE_MEMORY, 0, NULL);
 	if (!obj)
 		return -ENOMEM;
 
 	list->head = obj;
-	list->cnt = 0;
-	list->valid_cnt = 0;
-	list->base = U64_MAX;
-	list->range = 0;
 	return 0;
-}
-
-static int get_free_bitmap_no(struct aipu_memory_manager *mm, struct aipu_mem_region *reg,
-			      struct aipu_buf_request *buf_req)
-{
-	unsigned long alloc_nr = ALIGN(buf_req->bytes, PAGE_SIZE) >> PAGE_SHIFT;
-	unsigned long align_order = order_base_2(buf_req->align_in_page);
-	unsigned long mask = (1UL << align_order) - 1;
-	unsigned long offset = reg->base_pfn & ((1UL << align_order) - 1);
-
-	return bitmap_find_next_zero_area_off(reg->bitmap, reg->count, 0, alloc_nr, mask, offset);
 }
 
 static int aipu_mm_alloc_in_region_no_lock(struct aipu_memory_manager *mm,
@@ -1100,16 +536,13 @@ static int aipu_mm_alloc_in_region_no_lock(struct aipu_memory_manager *mm,
 					   struct aipu_mem_region *reg, struct file *filp,
 					   struct aipu_tcb_buf **tbuf_alloc)
 {
-	unsigned long bitmap_no = 0;
 	unsigned long alloc_nr = 0;
 	struct aipu_tcb_buf *tbuf = NULL;
 	u64 dev_pa = 0;
 	u32 dev_size = 0;
 
-	/* this allocator is called in both reserved & smmu cases */
-
 	/* filp == NULL means GM initialization or exit TCB allocation */
-	if (!mm || !buf_req || !reg || reg->invalid || !tbuf_alloc)
+	if (!mm || !buf_req || !reg || !tbuf_alloc)
 		return -EINVAL;
 
 	if (buf_req->data_type == AIPU_MM_DATA_TYPE_TCB) {
@@ -1120,39 +553,9 @@ static int aipu_mm_alloc_in_region_no_lock(struct aipu_memory_manager *mm,
 
 	alloc_nr = ALIGN(buf_req->bytes, PAGE_SIZE) >> PAGE_SHIFT;
 	dev_size = alloc_nr * PAGE_SIZE;
-	if (reg->reserved) {
-		bitmap_no = get_free_bitmap_no(mm, reg, buf_req);
-		if (bitmap_no >= reg->count) {
-			dev_dbg(reg->dev, "alloc in region failed: no free buffer");
-			goto fail;
-		}
-
-		if (!reg->pages[bitmap_no]) {
-			reg->pages[bitmap_no] =
-				devm_kzalloc(reg->dev, sizeof(struct aipu_virt_page), GFP_KERNEL);
-			if (!reg->pages[bitmap_no])
-				goto fail;
-		}
-
-		/* success */
-		reg->pages[bitmap_no]->contiguous_alloc_len = alloc_nr;
-		reg->pages[bitmap_no]->filp = filp;
-		reg->pages[bitmap_no]->tid = task_pid_nr(current);
-		reg->pages[bitmap_no]->locked = true;
-		reg->pages[bitmap_no]->tcb = NULL;
-		bitmap_set(reg->bitmap, bitmap_no, alloc_nr);
-
-		dev_pa = reg->base_iova + (bitmap_no << PAGE_SHIFT);
-	} else {
-		dev_pa = reg->base_iova;
-	}
+	dev_pa = reg->base_iova;
 
 	if (tbuf) {
-		if (reg->reserved) {
-			reg->pages[bitmap_no]->tcb = tbuf;
-			tbuf->pfn = bitmap_no;
-		}
-
 		/**
 		 * when head/tail is updated in job manager, all the following fields
 		 * should be updated together.
@@ -1177,100 +580,6 @@ static int aipu_mm_alloc_in_region_no_lock(struct aipu_memory_manager *mm,
 	dev_dbg(reg->dev, "allocation in region done: asid %d iova 0x%llx, bytes 0x%llx, type %d\n",
 		buf_req->asid, buf_req->desc.pa, buf_req->desc.bytes, buf_req->data_type);
 	return 0;
-
-fail:
-	if (tbuf)
-		destroy_tcb_buf(mm, tbuf);
-	return -ENOMEM;
-}
-
-static int aipu_mm_free_in_region(struct aipu_memory_manager *mm, struct aipu_buf_desc *buf,
-				  struct aipu_mem_region *reg, bool unlock)
-{
-	unsigned long bitmap_no = 0;
-	unsigned long alloc_nr = 0;
-	struct aipu_virt_page *page = NULL;
-	struct aipu_tcb_buf *tbuf = NULL;
-
-	if (!mm || !buf || !reg || reg->invalid)
-		return -EINVAL;
-
-	/* this __free__ function is only called for reserved cases */
-	bitmap_no = pa_to_bitmap_no(mm, reg, buf->pa);
-	if (bitmap_no >= reg->count) {
-		dev_err(reg->dev,
-			"free in region failed: no such an allocated buffer: pa 0x%llx",
-			buf->pa);
-		return -EINVAL;
-	}
-
-	page = reg->pages[bitmap_no];
-	if (!page) {
-		dev_err(reg->dev, "free in region failed: null page at bitmap_no %lu",
-			bitmap_no);
-		return -EINVAL;
-	}
-
-	alloc_nr = page->contiguous_alloc_len;
-	if (!alloc_nr) {
-		dev_err(reg->dev, "free in region failed: zero alloc_nr is invalid, 0x%llx\n",
-			buf->pa);
-		return -EINVAL;
-	}
-
-	/* do not update the __locked__ flag if unlock == false */
-	if (unlock)
-		page->locked = false;
-	else if (page->locked)
-		return DEFERRED_FREE;
-
-	tbuf = page->tcb;
-
-	/* do not free if this tcb is linked by a job or pinned;
-	 * marked as unlocked and will be released at an appropriate point;
-	 */
-	if (tbuf && (tbuf->dep_job_id || tbuf->pinned)) {
-		dev_info(reg->dev, "deferred free TCB: iova 0x%llx dep_job_id 0x%x ping %d\n",
-			 buf->pa, tbuf->dep_job_id, tbuf->pinned);
-		return DEFERRED_FREE;
-	}
-
-	/* do free */
-	destroy_tcb_buf(mm, tbuf);
-	bitmap_clear(reg->bitmap, bitmap_no, alloc_nr);
-	memset(page, 0, sizeof(struct aipu_virt_page));
-
-	dev_dbg(reg->dev, "free in region done: iova 0x%llx, bytes 0x%llx\n", buf->pa, buf->bytes);
-
-	return 0;
-}
-
-static void aipu_mm_free_filp_in_region(struct aipu_memory_manager *mm,
-					struct aipu_mem_region *reg, struct file *filp)
-{
-	unsigned long i = 0;
-	unsigned long offset = 0;
-	struct aipu_tcb_buf *tbuf = NULL;
-
-	if (!mm || !reg || !reg->bitmap || !filp)
-		return;
-
-	mutex_lock(&mm->lock);
-	while ((i = find_next_bit(reg->bitmap, reg->count, offset)) != reg->count) {
-		offset = i + reg->pages[i]->contiguous_alloc_len;
-		if (reg->pages[i] && reg->pages[i]->filp == filp) {
-			reg->pages[i]->locked = false;
-			tbuf = reg->pages[i]->tcb;
-			if (tbuf && (tbuf->dep_job_id || tbuf->pinned))
-				continue;
-
-			/* do free */
-			bitmap_clear(reg->bitmap, i, reg->pages[i]->contiguous_alloc_len);
-			memset(reg->pages[i], 0, sizeof(struct aipu_virt_page));
-			destroy_tcb_buf(mm, tbuf);
-		}
-	}
-	mutex_unlock(&mm->lock);
 }
 
 static ssize_t aipu_gm_policy_sysfs_show(struct device *dev, struct device_attribute *attr,
@@ -1316,217 +625,6 @@ static ssize_t aipu_gm_policy_sysfs_store(struct device *dev, struct device_attr
 	return count;
 }
 
-static void add_region_list(struct aipu_memory_manager *mm, int asid,
-			    struct aipu_mem_region *reg)
-{
-	struct aipu_mem_region_obj *obj = kmem_cache_zalloc(mm->obj_cache, GFP_KERNEL);
-
-	obj->reg = reg;
-	INIT_LIST_HEAD(&obj->list);
-
-	list_add(&obj->list, &mm->ase[asid].head->list);
-	mm->ase[asid].cnt++;
-}
-
-static int aipu_mm_reserved_iova_for_never_map(struct aipu_memory_manager *mm, bool flag)
-{
-	struct iommu_domain *iommu_domain = NULL;
-	struct iommu_dma_cookie *cookie = NULL;
-	struct iova_domain *iovad = NULL;
-	u64 bus_dma_limit;
-	unsigned long lo, hi;
-	struct iova *iova;
-	unsigned long iova_start;
-	unsigned long  iova_len = SZ_1G;
-
-	if (!mm)
-		return -EINVAL;
-
-	iommu_domain = mm->iommu_domain;
-	cookie = iommu_domain->iova_cookie;
-	iovad = &cookie->iovad;
-
-	bus_dma_limit = mm->dev->bus_dma_limit;
-	if (bus_dma_limit == 0xc0000000 || bus_dma_limit == 0xe0000000)
-		bus_dma_limit = 0x100000000;
-
-	do {
-		iova_start = bus_dma_limit - iova_len;
-		lo = iova_start >> PAGE_SHIFT;
-		hi = (iova_start + iova_len) >> PAGE_SHIFT;
-		iova = reserve_iova(iovad, lo, hi - 1);
-		if (!flag)
-			__free_iova(iovad, iova);
-		bus_dma_limit -= 0x100000000;
-	} while (bus_dma_limit > 0);
-
-	return 0;
-}
-
-static int aipu_mm_add_reserved_regions(struct aipu_memory_manager *mm)
-{
-	int ret = 0;
-	int idx = 0;
-	int asid_idx = 0;
-	struct device_node *np = NULL;
-	enum aipu_mem_region_type type;
-	struct resource res;
-	struct aipu_mem_region_obj *obj = NULL;
-	struct aipu_mem_region *reg = NULL;
-	bool asid_set = false;
-	u32 dtcm_cnt = 0;
-	u64 offset = 0;
-	u32 res_cnt = 0;
-
-	do {
-		u64 size = 0;
-
-		np = of_parse_phandle(mm->dev->of_node, "memory-region", idx);
-		if (!np)
-			break;
-
-		/* get type of this region */
-		if (!strcmp(np->name, "memory")) {
-			type = AIPU_MEM_REGION_TYPE_MEMORY;
-		} else if (!strcmp(np->name, "sram")) {
-			type = AIPU_MEM_REGION_TYPE_SRAM;
-		} else if (!strcmp(np->name, "dtcm")) {
-			type = AIPU_MEM_REGION_TYPE_DTCM;
-		} else {
-			dev_err(mm->dev, "invalid memory region name: %s\n", np->name);
-			continue;
-		}
-
-		/* bypass mapping SoC SRAM if CPU cannot access it */
-		if (type == AIPU_MEM_REGION_TYPE_SRAM) {
-			dev_info(mm->dev, "dts: bypass this sram region (cpu cannot access it)\n");
-			continue;
-		}
-
-		if (type == AIPU_MEM_REGION_TYPE_DTCM && dtcm_cnt == mm->dtcm_max_cnt) {
-			dev_err(mm->dev, "dts: bypass this dtcm region for the max_cnt limit\n");
-			continue;
-		}
-
-		if (type == AIPU_MEM_REGION_TYPE_DTCM &&
-		    mm->version == AIPU_ISA_VERSION_ZHOUYI_V1) {
-			dev_err(mm->dev, "dts: bypass because v1 does not support dtcm\n");
-			continue;
-		}
-
-		ret = of_address_to_resource(np, 0, &res);
-		if (ret) {
-			of_node_put(np);
-			dev_err(mm->dev, "of_address_to_resource failed (ret = %d)", ret);
-			continue;
-		}
-
-		size = res.end - res.start + 1;
-
-		if (of_property_read_u64(np, "host-aipu-offset", &offset))
-			offset = 0;
-
-		obj = aipu_mm_create_region_object(mm, type, size, offset, idx, NULL, true);
-		if (!obj) {
-			dev_err(mm->dev, "create new region failed (ret = %ld)", PTR_ERR(reg));
-			continue;
-		}
-
-		reg = obj->reg;
-		list_add(&obj->list, &mm->mem.head->list);
-
-		/* get asid of this region */
-		if (mm->version > AIPU_ISA_VERSION_ZHOUYI_V1) {
-			for (asid_idx = 0; asid_idx < ZHOUYI_ASID_COUNT; asid_idx++) {
-				u32 asid = 0;
-
-				if (!of_property_read_u32_index(np, "asid", asid_idx, &asid)) {
-					if (asid >= ZHOUYI_ASID_COUNT) {
-						dev_err(mm->dev, "dts: invalid asid: %u\n", asid);
-						continue;
-					}
-
-					add_region_list(mm, asid, reg);
-					if (asid >= mm->valid_asid_cnt)
-						mm->valid_asid_cnt = asid + 1;
-
-					asid_set = true;
-				} else {
-					break;
-				}
-			}
-
-			if (!asid_set) {
-				dev_err(mm->dev, "dts: reg asid is not set, use default asid\n");
-				mm->valid_asid_cnt = 2;
-				add_region_list(mm, AIPU_BUF_ASID_0, reg);
-				add_region_list(mm, AIPU_BUF_ASID_1, reg);
-			}
-		} else {
-			/* use ASID 0 for V1 */
-			add_region_list(mm, AIPU_BUF_ASID_0, reg);
-		}
-
-		of_node_put(np);
-		if (type == AIPU_MEM_REGION_TYPE_DTCM)
-			dtcm_cnt++;
-		res_cnt++;
-	} while (++idx < AIPU_CONFIG_MAX_RESERVED_REGIONS);
-
-	return res_cnt;
-}
-
-static void aipu_mm_set_asid_base(struct aipu_memory_manager *mm)
-{
-	struct aipu_mem_region_obj *obj = NULL;
-	struct aipu_mem_region *reg = NULL;
-	int asid = AIPU_BUF_ASID_0;
-
-	for (asid = AIPU_BUF_ASID_0; asid < ZHOUYI_ASID_COUNT; asid++) {
-		u64 first_base = 0;
-		u64 asid_base = 0;
-		u64 range = 0;
-		u64 high = 0;
-		u64 end  = 0;
-
-		list_for_each_entry(obj, &mm->ase[asid].head->list, list) {
-			reg = obj->reg;
-			end = reg->base_iova + reg->bytes;
-
-			if (!range) {
-				high = end;
-				first_base = reg->base_iova;
-				asid_base = first_base;
-				range = reg->bytes;
-			}
-
-			if (reg->base_iova >> 32 != first_base >> 32) {
-				dev_err(mm->dev, "invalid region: [0x%llx, 0x%llx]",
-					reg->base_iova, reg->base_iova + reg->bytes - 1);
-				dev_err(mm->dev, "one asid should use the same hi32 base");
-				reg->invalid = true;
-				continue;
-			}
-
-			high = end > high ? end : high;
-
-			if (reg->base_iova != first_base) {
-				asid_base = ((first_base >> 32) << 32);
-				range = high;
-			}
-
-			mm->ase[asid].valid_cnt++;
-		}
-
-		if (range) {
-			mm->ase[asid].base = asid_base;
-			mm->ase[asid].range = range;
-			dev_info(mm->dev, "set ASID %d done: base: 0x%llx, range 0x%llx\n",
-				 asid, asid_base, range);
-		}
-	}
-}
-
 /**
  * @aipu_init_mm() - initialize mm module during driver probe phase
  * @mm:      pointer to memory manager struct to be initialized
@@ -1539,7 +637,6 @@ int aipu_init_mm(struct aipu_memory_manager *mm, struct platform_device *p_dev, 
 {
 	int ret = 0;
 	struct iommu_group *group = NULL;
-	int asid = 0;
 
 	if (!mm || !p_dev)
 		return -EINVAL;
@@ -1548,10 +645,6 @@ int aipu_init_mm(struct aipu_memory_manager *mm, struct platform_device *p_dev, 
 	mm->version = version;
 	mm->dev = &p_dev->dev;
 	mutex_init(&mm->lock);
-	mm->sram_disable_head = devm_kzalloc(mm->dev, sizeof(*mm->sram_disable_head), GFP_KERNEL);
-	if (!mm->sram_disable_head)
-		return -ENOMEM;
-	INIT_LIST_HEAD(&mm->sram_disable_head->list);
 	mm->importer_bufs = devm_kzalloc(mm->dev, sizeof(*mm->importer_bufs), GFP_KERNEL);
 	if (!mm->importer_bufs)
 		return -ENOMEM;
@@ -1574,28 +667,16 @@ int aipu_init_mm(struct aipu_memory_manager *mm, struct platform_device *p_dev, 
 	if (!mm->obj_cache || !mm->reg_cache || !mm->tbuf_cache || !mm->hold_tbuf_cache)
 		return -ENOMEM;
 
-	for (asid = AIPU_BUF_ASID_0; asid < ZHOUYI_ASID_COUNT; asid++) {
-		ret = init_region_list(mm, &mm->ase[asid]);
-		if (ret)
-			goto finish;
-	}
-
 	ret = init_region_list(mm, &mm->mem);
 	if (ret)
 		goto finish;
 
-	/* we accept at maximum 2 GM regions: for QoS fast & slow */
-	if (mm->version == AIPU_ISA_VERSION_ZHOUYI_V3)
-		mm->gm_max_cnt = 2;
-
-	/* currently, we only support one DTCM region in v2_2 */
-	if (mm->version == AIPU_ISA_VERSION_ZHOUYI_V2_2)
-		mm->dtcm_max_cnt = 1;
-
 	if (version == AIPU_ISA_VERSION_ZHOUYI_V3) {
 		mm->hold_tcb_head = kmem_cache_zalloc(mm->hold_tbuf_cache, GFP_KERNEL);
-		if (!mm->hold_tcb_head)
+		if (!mm->hold_tcb_head) {
+			ret = -ENOMEM;
 			goto finish;
+		}
 		INIT_LIST_HEAD(&mm->hold_tcb_head->node);
 		mm->hold_tcb_head->nums = 0;
 	}
@@ -1640,9 +721,14 @@ int aipu_init_mm(struct aipu_memory_manager *mm, struct platform_device *p_dev, 
 			 */
 			ret = aipu_mm_v3_init_iova_domain(mm);
 			if (ret) {
-				dev_err(mm->dev, "V3: failed to init custom IOVA domain (%d), falling back\n", ret);
-				mm->use_v3_custom_iova = false;
-				mm->valid_asid_cnt = 1;
+				/*
+				 * fail the probe instead of falling
+				 * back: the fallback this branch used to limp
+				 * into was deleted as dead weight, and its
+				 * forbidden-zone reservation loop could hang
+				 * the probe outright.
+				 */
+				dev_err(mm->dev, "V3: failed to init custom IOVA domain (%d)\n", ret);
 			} else {
 				mm->use_v3_custom_iova = true;
 				mm->valid_asid_cnt = 4;
@@ -1652,32 +738,9 @@ int aipu_init_mm(struct aipu_memory_manager *mm, struct platform_device *p_dev, 
 		}
 	}
 	iommu_group_put(group);
+	if (ret)
+		goto finish;
 	dev_info(mm->dev, "AIPU is%s behind an IOMMU.\n", mm->has_iommu ? "" : " not");
-
-	/*
-	 * If AIPU is behind an IOMMU, in devicetree, memory-region attribute is optional;
-	 * otherwise the device specific or system global DMA/CMA region is used;
-	 *
-	 * KMD can accept multiple DRAM regions and/or multiple SRAM regions;
-	 */
-	if (!mm->has_iommu)
-		mm->res_cnt = aipu_mm_add_reserved_regions(mm);
-	else if (mm->version == AIPU_ISA_VERSION_ZHOUYI_V3 && !mm->use_v3_custom_iova) {
-		/*
-		 * V3 + IOMMU (fallback mode): constrain DMA to 32-bit / 3GB
-		 * This is the original behavior when custom IOVA fails.
-		 */
-		mm->dev->bus_dma_limit = 0xc0000000;
-		mm->dma_mask = 32;
-		mm->default_asid_size = SZ_2G;
-		if (aipu_mm_reserved_iova_for_never_map(mm, IOVA_ALLOC))
-			dev_warn(mm->dev, "failed to reserve iova forbidden zones");
-	}
-
-	if (version > AIPU_ISA_VERSION_ZHOUYI_V1 && mm->res_cnt)
-		aipu_mm_set_asid_base(mm);
-
-	dev_info(mm->dev, "driver mem management is %s\n", mm->res_cnt ? "enabled" : "disabled");
 
 finish:
 	if (ret)
@@ -1691,7 +754,6 @@ finish:
  */
 int aipu_deinit_mm(struct aipu_memory_manager *mm)
 {
-	int id = AIPU_BUF_ASID_0;
 	struct aipu_mem_region_obj *obj = NULL;
 	struct aipu_mem_region_obj *next = NULL;
 
@@ -1702,14 +764,22 @@ int aipu_deinit_mm(struct aipu_memory_manager *mm)
 		}
 	}
 
-	if (mm->version == AIPU_ISA_VERSION_ZHOUYI_V3) {
-		if (mm->hold_tbuf_cache) {
-			aipu_mm_hold_tcb_buf_free(mm);
+	/*
+	 * aipu_init_mm() creates hold_tbuf_cache unconditionally;
+	 * a version guard here leaked it on non-V3.
+	 */
+	if (mm->hold_tbuf_cache) {
+		aipu_mm_hold_tcb_buf_free(mm);
+		/*
+		 * hold_tcb_head is NULL when its allocation failed
+		 * (or on non-V3); kmem_cache_free() does not accept NULL.
+		 */
+		if (mm->hold_tcb_head) {
 			kmem_cache_free(mm->hold_tbuf_cache, mm->hold_tcb_head);
 			mm->hold_tcb_head = NULL;
-			kmem_cache_destroy(mm->hold_tbuf_cache);
-			mm->hold_tbuf_cache = NULL;
 		}
+		kmem_cache_destroy(mm->hold_tbuf_cache);
+		mm->hold_tbuf_cache = NULL;
 	}
 
 	if (mm->mem.head) {
@@ -1720,27 +790,7 @@ int aipu_deinit_mm(struct aipu_memory_manager *mm)
 		mm->mem.head = NULL;
 	}
 
-	for (id = AIPU_BUF_ASID_0; id < ZHOUYI_ASID_COUNT; id++) {
-		if (mm->ase[id].head) {
-			list_for_each_entry_safe(obj, next, &mm->ase[id].head->list, list) {
-				list_del(&obj->list);
-				kmem_cache_free(mm->obj_cache, obj);
-				/* reg has been freed when destroying mm->mem */
-			}
-
-			kmem_cache_free(mm->reg_cache, mm->ase[id].head->reg);
-			kmem_cache_free(mm->obj_cache, mm->ase[id].head);
-			mm->ase[id].head = NULL;
-		}
-	}
-
-	if (mm->has_iommu && mm->version == AIPU_ISA_VERSION_ZHOUYI_V3) {
-		if (mm->use_v3_custom_iova)
-			aipu_mm_v3_deinit_iova_domain(mm);
-		else
-			aipu_mm_reserved_iova_for_never_map(mm, IOVA_FREE);
-	}
-	mm->res_cnt = 0;
+	aipu_mm_v3_deinit_iova_domain(mm);
 	kmem_cache_destroy(mm->obj_cache);
 	mm->obj_cache = NULL;
 	kmem_cache_destroy(mm->reg_cache);
@@ -1758,8 +808,7 @@ static int aipu_mm_direct_alloc(struct aipu_memory_manager *mm, struct aipu_buf_
 	struct aipu_mem_region_obj *obj = NULL;
 	struct aipu_tcb_buf *tcb = NULL;
 
-	obj = aipu_mm_create_region_object(mm, AIPU_MEM_REGION_TYPE_MEMORY, buf_req->bytes, 0, 0,
-					   filp, false);
+	obj = aipu_mm_create_region_object(mm, AIPU_MEM_REGION_TYPE_MEMORY, buf_req->bytes, filp);
 	if (!obj || !obj->reg)
 		return -ENOMEM;
 
@@ -1866,12 +915,9 @@ int aipu_mm_alloc(struct aipu_memory_manager *mm, struct aipu_buf_request *buf_r
 		  struct file *filp)
 {
 	int ret = 0;
-	struct aipu_mem_region_obj *obj = NULL;
-	int type;
 	unsigned long flags;
 	struct aipu_tcb_buf *tbuf = NULL;
 	bool allocated = false;
-	bool fall_back = false;
 
 	if (!mm || !buf_req)
 		return -EINVAL;
@@ -1883,96 +929,32 @@ int aipu_mm_alloc(struct aipu_memory_manager *mm, struct aipu_buf_request *buf_r
 		return -EINVAL;
 	}
 
-	if (mm->version == AIPU_ISA_VERSION_ZHOUYI_V1)
-		buf_req->asid = AIPU_BUF_ASID_0;
-
-	if (buf_req->region < AIPU_MEM_REGION_TYPE_MAX) {
-		type = buf_req->region;
-	} else {
+	if (buf_req->region >= AIPU_MEM_REGION_TYPE_MAX) {
 		dev_err(mm->dev, "[malloc] invalid alloc request: region type %d",
 			buf_req->region);
 		return -EINVAL;
 	}
 
-	/* fall back to SRAM if DTCM/GM is not applicable for certain archs */
-	if (mm->version < AIPU_ISA_VERSION_ZHOUYI_V2_2 && type == AIPU_MEM_REGION_TYPE_DTCM)
-		type = AIPU_MEM_REGION_TYPE_SRAM;
-
-	if ((mm->version < AIPU_ISA_VERSION_ZHOUYI_V3 || mm->gm_policy == AIPU_GM_POLICY_NONE) &&
-	    type == AIPU_MEM_REGION_TYPE_GM)
-		type = AIPU_MEM_REGION_TYPE_SRAM;
-
-	/* Support the smmu dynamic weight buffer allocation. */
-	if ((mm->has_iommu && type == AIPU_MEM_REGION_TYPE_MEMORY &&
-	    (buf_req->data_type == AIPU_MM_DATA_TYPE_WEIGHT ||
-	    buf_req->asid > AIPU_BUF_ASID_0)) || !mm->res_cnt) {
-		/* V3 with custom IOVA: use dedicated IOVA allocation */
-		if (mm->version == AIPU_ISA_VERSION_ZHOUYI_V3 && 
-		    mm->use_v3_custom_iova) {
-			ret = aipu_alloc_dma_iova_phy(mm, buf_req, filp);
-			allocated = !ret;
-			goto tcb_handle;
-		}
-		ret = aipu_mm_direct_alloc(mm, buf_req, filp, &tbuf);
-		allocated = !ret;
-		goto tcb_handle;
-	}
-
-	mutex_lock(&mm->lock);
-
-	/* should check after lock */
-	if (type == AIPU_MEM_REGION_TYPE_SRAM && mm->sram_disable)
-		type = AIPU_MEM_REGION_TYPE_MEMORY;
-
-	/* V3 with custom IOVA: use dedicated IOVA allocation for all memory types */
-	if (mm->version == AIPU_ISA_VERSION_ZHOUYI_V3 && 
-	    mm->has_iommu && mm->use_v3_custom_iova &&
-	    type == AIPU_MEM_REGION_TYPE_MEMORY) {
+	/* V3 with custom IOVA: use dedicated IOVA allocation */
+	if (mm->version == AIPU_ISA_VERSION_ZHOUYI_V3 &&
+	    mm->use_v3_custom_iova)
 		ret = aipu_alloc_dma_iova_phy(mm, buf_req, filp);
-		allocated = !ret;
-		goto tcb_handle;
-	}
+	else
+		ret = aipu_mm_direct_alloc(mm, buf_req, filp, &tbuf);
+	allocated = !ret;
 
-alloc:
-	list_for_each_entry(obj, &mm->ase[buf_req->asid].head->list, list) {
-		if (obj->reg->type == type) {
-			ret = aipu_mm_alloc_in_region_no_lock(mm, buf_req, obj->reg, filp, &tbuf);
-			if (!ret) {
-				allocated = true;
-				break;
-			}
-		}
-	}
-
-	/* fall back to main memory */
-	if (!allocated && !fall_back) {
-		if (type != AIPU_MEM_REGION_TYPE_MEMORY) {
-			type = AIPU_MEM_REGION_TYPE_MEMORY;
-			fall_back = true;
-			goto alloc;
-		} else if (buf_req->asid > AIPU_BUF_ASID_0) {
-			dev_dbg(mm->dev, "fail to malloc memory size 0x%llx from asid %d ",
-				buf_req->bytes, buf_req->asid);
-			buf_req->asid++;
-			dev_dbg(mm->dev, "change new asid %d\n", buf_req->asid);
-			if (buf_req->asid < mm->valid_asid_cnt)
-				goto alloc;
-			else
-				dev_err(mm->dev, "Inalid asid parameter.\n");
-		}
-	}
-
-	WARN_ON(buf_req->desc.pa % (buf_req->align_in_page << PAGE_SHIFT));
-	mutex_unlock(&mm->lock);
-
-tcb_handle:
 	if (tbuf) {
 		spin_lock_irqsave(&mm->slock, flags);
 		list_add_tail(&tbuf->node, &tbuf->reg->tcb_buf_head->node);
 		spin_unlock_irqrestore(&mm->slock, flags);
 	}
 
-	if (mm->version >= AIPU_ISA_VERSION_ZHOUYI_V3) {
+	/*
+	 * Only inspect desc when the allocation above actually succeeded: on a
+	 * failure path buf_req->desc still holds the wholesale copy from
+	 * userspace, and aipu_mm_free would then free a caller-named descriptor.
+	 */
+	if (!ret && allocated && mm->version >= AIPU_ISA_VERSION_ZHOUYI_V3) {
 		if (!aipu_mm_check_address_validity(mm, &buf_req->desc)) {
 			aipu_mm_free(mm, &buf_req->desc, filp, true);
 			allocated = false;
@@ -1989,9 +971,8 @@ tcb_handle:
 			buf_req->data_type);
 	} else {
 		dev_dbg(mm->dev,
-			"allocate done (%s): asid %d iova 0x%llx, type %d, "
+			"allocate done: asid %d iova 0x%llx, type %d, "
 			"bytes 0x%llx (al %d, rg %d)\n",
-			fall_back ? "fall back to memory" : "as requested",
 			buf_req->asid, buf_req->desc.pa, buf_req->data_type,
 			buf_req->bytes, buf_req->align_in_page,
 			buf_req->desc.region);
@@ -2058,10 +1039,7 @@ int aipu_mm_free(struct aipu_memory_manager *mm, struct aipu_buf_desc *buf, stru
 		return -EINVAL;
 
 	mutex_lock(&mm->lock);
-	if (reg->reserved)
-		ret = aipu_mm_free_in_region(mm, buf, reg, unlock);
-	else
-		ret = aipu_mm_direct_free(mm, reg, unlock);
+	ret = aipu_mm_direct_free(mm, reg, unlock);
 	mutex_unlock(&mm->lock);
 
 	if (ret == DEFERRED_FREE)
@@ -2126,7 +1104,7 @@ static void tensor_flush_dcache_range(void *start, void *end) {
  *
  * Return: 0 on success and error code otherwise.
  */
-int aipu_mm_cache_flush(struct aipu_memory_manager *mm, struct aipu_buf_desc *buf)
+int aipu_mm_cache_flush(struct aipu_memory_manager *mm, struct aipu_buf_desc *buf, struct file *filp)
 {
 	int ret = 0;
 	struct aipu_mem_region *reg = NULL;
@@ -2138,21 +1116,37 @@ int aipu_mm_cache_flush(struct aipu_memory_manager *mm, struct aipu_buf_desc *bu
 		return -EINVAL;
 
 	/* V3 custom IOVA */
-	if (mm->version == AIPU_ISA_VERSION_ZHOUYI_V3 && 
+	if (mm->version == AIPU_ISA_VERSION_ZHOUYI_V3 &&
 	    mm->has_iommu && mm->use_v3_custom_iova) {
 		for (asid = 0; asid < ZHOUYI_ASID_COUNT; asid++) {
 			iova = aipu_mm_v3_pa_to_iova(mm, buf->pa, asid);
 			if (!iova)
 				continue;
-			
+
+			/* only flush a buffer this fd owns */
+			if (!aipu_mm_v3_find_owned_buffer_by_iova(mm, iova, filp))
+				continue;
+
 			block = aipu_mm_v3_find_block_by_iova(mm, iova, asid);
-			if (block && block->va) {
-				aipu_cache_flush(mm, block->va, block->size);
+			if (block) {
+				/* Non-TCB blocks carry no kernel alias since
+				 * the vmap restriction; the user
+				 * mapping is Normal-NC, so there is no dirty
+				 * line to flush. Owned-but-unaliased is a
+				 * no-op success.
+				 */
+				if (block->va)
+					aipu_cache_flush(mm, block->va, block->size);
 				return 0;
 			}
 		}
-		dev_dbg(mm->dev, "V3: cache_flush no block for pa 0x%llx\n", buf->pa);
-		return 0;
+		/*
+		 * No owned block resolved: report the failure instead of the
+		 * old silent success, which left userspace to proceed on stale
+		 * data.
+		 */
+		dev_dbg(mm->dev, "V3: cache_flush no owned block for pa 0x%llx\n", buf->pa);
+		return -EINVAL;
 	}
 
 	reg = aipu_mm_find_region(mm, buf->pa, "flush");
@@ -2178,7 +1172,7 @@ int aipu_mm_cache_flush(struct aipu_memory_manager *mm, struct aipu_buf_desc *bu
  *
  * Return: 0 on success and error code otherwise.
  */
-int aipu_mm_cache_invalid(struct aipu_memory_manager *mm, struct aipu_buf_desc *buf)
+int aipu_mm_cache_invalid(struct aipu_memory_manager *mm, struct aipu_buf_desc *buf, struct file *filp)
 {
 	int ret = 0;
 	struct aipu_mem_region *reg = NULL;
@@ -2190,21 +1184,36 @@ int aipu_mm_cache_invalid(struct aipu_memory_manager *mm, struct aipu_buf_desc *
 		return -EINVAL;
 
 	/* V3 custom IOVA */
-	if (mm->version == AIPU_ISA_VERSION_ZHOUYI_V3 && 
+	if (mm->version == AIPU_ISA_VERSION_ZHOUYI_V3 &&
 	    mm->has_iommu && mm->use_v3_custom_iova) {
 		for (asid = 0; asid < ZHOUYI_ASID_COUNT; asid++) {
 			iova = aipu_mm_v3_pa_to_iova(mm, buf->pa, asid);
 			if (!iova)
 				continue;
-			
+
+			/*
+			 * only invalidate a buffer this fd owns: a stray
+			 * invalidate discards another process's dirty lines
+			 *
+			 */
+			if (!aipu_mm_v3_find_owned_buffer_by_iova(mm, iova, filp))
+				continue;
+
 			block = aipu_mm_v3_find_block_by_iova(mm, iova, asid);
-			if (block && block->va) {
-				aipu_cache_invalidate(mm, block->va, block->size);
+			if (block) {
+				/* Non-TCB blocks carry no kernel alias since
+				 * the vmap restriction; nothing here
+				 * reads them through the cache, so there is
+				 * no stale line to discard. Owned-but-
+				 * unaliased is a no-op success.
+				 */
+				if (block->va)
+					aipu_cache_invalidate(mm, block->va, block->size);
 				return 0;
 			}
 		}
-		dev_dbg(mm->dev, "V3: cache_invalid no block for pa 0x%llx\n", buf->pa);
-		return 0;
+		dev_dbg(mm->dev, "V3: cache_invalid no owned block for pa 0x%llx\n", buf->pa);
+		return -EINVAL;
 	}
 
 	reg = aipu_mm_find_region(mm, buf->pa, "invalid");
@@ -2247,11 +1256,6 @@ void aipu_mm_free_buffers(struct aipu_memory_manager *mm, struct file *filp)
 			/* --- reg should not be used below --- */
 	}
 	mutex_unlock(&mm->lock);
-
-	if (mm->res_cnt) {
-		list_for_each_entry_safe(obj, next, &mm->mem.head->list, list)
-			aipu_mm_free_filp_in_region(mm, obj->reg, filp);
-	}
 }
 
 static int aipu_vma_map_pages(struct vm_area_struct *vma, struct page **pages,
@@ -2312,18 +1316,28 @@ int aipu_mm_mmap_buf(struct aipu_memory_manager *mm, struct vm_area_struct *vma,
 			iova = aipu_mm_v3_pa_to_iova(mm, dev_pa, asid);
 			if (!iova)
 				continue;
-			
+
+			/* only map a buffer this fd owns */
+			if (!aipu_mm_v3_find_owned_buffer_by_iova(mm, iova, filp))
+				continue;
+
 			block = aipu_mm_v3_find_block_by_iova(mm, iova, asid);
 			if (block)
 				break;
 		}
-		
+
 		if (!block) {
-			dev_err(mm->dev, "V3 mmap: no block found for pa 0x%llx\n", dev_pa);
+			dev_err(mm->dev, "V3 mmap: no owned block for pa 0x%llx\n", dev_pa);
 			return -EINVAL;
 		}
 
-		vma->vm_pgoff = 0;
+		/*
+		 * Honour the offset of dev_pa within its block instead of always
+		 * mapping from page 0: the caller may mmap partway into a buffer,
+		 * and aipu_vma_map_pages bounds-checks this page offset against the
+		 * block's page_count.
+		 */
+		vma->vm_pgoff = (iova - block->iova_start) >> PAGE_SHIFT;
 		ret = aipu_vma_map_pages(vma, block->pages, block->page_count);
 		if (ret)
 			dev_err(mm->dev, "V3 mmap failed at pa 0x%llx (ret = %d)", dev_pa, ret);
@@ -2341,97 +1355,6 @@ int aipu_mm_mmap_buf(struct aipu_memory_manager *mm, struct vm_area_struct *vma,
 
 	vma->vm_pgoff = dev_pa >> PAGE_SHIFT;
 
-	return ret;
-}
-
-/**
- * @aipu_mm_disable_sram_allocation() - disable buffer allocations from soc sram
- * @mm: pointer to memory manager struct initialized in aipu_init_mm()
- * @filp: pointer to the file struct
- *
- * Return: 0 on success and error code otherwise.
- */
-int aipu_mm_disable_sram_allocation(struct aipu_memory_manager *mm, struct file *filp)
-{
-	int ret = 0;
-	struct aipu_mem_region_obj *obj = NULL;
-	struct aipu_mem_region *reg = NULL;
-	struct aipu_sram_disable_per_fd *sram_disable_per_fd = NULL;
-
-	if (!mm || !mm->res_cnt)
-		return -EINVAL;
-
-	mutex_lock(&mm->lock);
-	/* If SRAM is under using by driver & AIPU, it cannot be disabled. */
-	list_for_each_entry(obj, &mm->mem.head->list, list) {
-		reg = obj->reg;
-
-		if (reg->type == AIPU_MEM_REGION_TYPE_SRAM &&
-		    !bitmap_empty(reg->bitmap, reg->count)) {
-			dev_err(mm->dev, "the SRAM region to be disabled is under using");
-			ret = -EPERM;
-			break;
-		}
-	}
-
-	if (!ret) {
-		int found = 0;
-
-		list_for_each_entry(sram_disable_per_fd, &mm->sram_disable_head->list, list) {
-			if (sram_disable_per_fd->filp == filp) {
-				sram_disable_per_fd->cnt++;
-				found = 1;
-				break;
-			}
-		}
-		if (!found) {
-			sram_disable_per_fd = kzalloc(sizeof(*sram_disable_per_fd), GFP_KERNEL);
-			if (!sram_disable_per_fd) {
-				ret = -ENOMEM;
-				goto unlock;
-			}
-			sram_disable_per_fd->cnt++;
-			sram_disable_per_fd->filp = filp;
-			list_add(&sram_disable_per_fd->list, &mm->sram_disable_head->list);
-		}
-		mm->sram_disable++;
-	}
-unlock:
-	mutex_unlock(&mm->lock);
-	return ret;
-}
-
-/**
- * @aipu_mm_enable_sram_allocation() - enable buffer allocations from soc sram (disabled before)
- * @mm:   pointer to memory manager struct initialized in aipu_init_mm()
- * @filp: pointer to the file struct
- *
- * Return: 0 on success and error code otherwise.
- */
-int aipu_mm_enable_sram_allocation(struct aipu_memory_manager *mm, struct file *filp)
-{
-	int ret = 0;
-	struct aipu_sram_disable_per_fd *sram_disable_per_fd = NULL;
-
-	if (!mm || !mm->res_cnt)
-		return -EINVAL;
-
-	mutex_lock(&mm->lock);
-	if (mm->sram_disable == 0) {
-		ret = -EPERM;
-		goto unlock;
-	}
-
-	list_for_each_entry(sram_disable_per_fd, &mm->sram_disable_head->list, list) {
-		if (sram_disable_per_fd->filp == filp) {
-			if (sram_disable_per_fd->cnt)
-				sram_disable_per_fd->cnt--;
-			break;
-		}
-	}
-	mm->sram_disable--;
-unlock:
-	mutex_unlock(&mm->lock);
 	return ret;
 }
 
@@ -2539,66 +1462,6 @@ unlock:
 }
 
 /**
- * @aipu_mm_set_tcb_tail() - set the pointer to the tail TCB of a TCB list.
- * @mm:   pointer to memory manager struct initialized in aipu_init_mm()
- * @tail: address of the tail TCB of a TCB list
- *
- * Return: 0 on success and error code otherwise.
- */
-struct aipu_tcb *aipu_mm_set_tcb_tail(struct aipu_memory_manager *mm, u64 tail)
-{
-	struct aipu_mem_region *reg = NULL;
-	struct aipu_tcb_buf *tbuf = NULL;
-	struct aipu_phy_block *block;
-	unsigned long flags;
-	struct aipu_tcb *ret = NULL;
-	char *va = NULL;
-	u64 iova;
-	u32 asid;
-
-	/* V3 custom IOVA */
-	if (mm->version == AIPU_ISA_VERSION_ZHOUYI_V3 && 
-	    mm->has_iommu && mm->use_v3_custom_iova) {
-		for (asid = 0; asid < ZHOUYI_ASID_COUNT; asid++) {
-			iova = aipu_mm_v3_pa_to_iova(mm, tail, asid);
-			if (!iova)
-				continue;
-			
-			spin_lock_irqsave(&mm->slock, flags);
-			tbuf = aipu_mm_find_tcb_buf_no_lock(mm, iova, "set_tail");
-			if (tbuf) {
-				block = aipu_mm_v3_find_block_by_iova(mm, iova, asid);
-				if (block && block->va) {
-					va = block->va + (iova - block->iova_start);
-					tbuf->tail = tail;
-					tbuf->tail_tcb = (struct aipu_tcb *)va;
-					ret = tbuf->tail_tcb;
-				}
-			}
-			spin_unlock_irqrestore(&mm->slock, flags);
-			if (ret)
-				return ret;
-		}
-		return NULL;
-	}
-
-	/* Original path */
-	spin_lock_irqsave(&mm->slock, flags);
-	tbuf = aipu_mm_find_tcb_buf_no_lock(mm, tail, "set_tail");
-	if (!tbuf)
-		goto unlock;
-
-	reg = tbuf->reg;
-	tbuf->tail = tail;
-	tbuf->tail_tcb = (struct aipu_tcb *)((char *)(reg->base_va) + tail - reg->base_iova);
-	ret = tbuf->tail_tcb;
-
-unlock:
-	spin_unlock_irqrestore(&mm->slock, flags);
-	return ret;
-}
-
-/**
  * @aipu_mm_link_tcb() - link a TCB list to the tail of an existing TCB list.
  * @mm:           pointer to memory manager struct initialized in aipu_init_mm()
  * @prev_tail:    address of the tail TCB of a previous TCB list to be linked
@@ -2620,6 +1483,11 @@ int aipu_mm_link_tcb(struct aipu_memory_manager *mm, u64 prev_tail, u32 next_hea
 		return -EFAULT;
 
 	spin_lock_irqsave(&mm->shlock, flags);
+	if (!htbuf->hold_tcb) {
+		dev_err(mm->dev, "hold TCB was not set before linking it");
+		spin_unlock_irqrestore(&mm->shlock, flags);
+		return -EFAULT;
+	}
 	htbuf->hold_tcb->next = next_head_32;
 	htbuf->hold_tcb->flag &= ~TCB_FLAG_END_TYPE_GRID_END;
 	temp = htbuf->hold_tcb->next;
@@ -2642,17 +1510,15 @@ int aipu_mm_link_tcb(struct aipu_memory_manager *mm, u64 prev_tail, u32 next_hea
 /**
  * @aipu_mm_unlink_tcb() - unlink a TCB list from an existing TCB list.
  * @mm:           pointer to memory manager struct initialized in aipu_init_mm()
- * @prev_tail:    address of the tail TCB of a previous TCB list to be unlinked
- * @free_tcb:     free TCB or not
+ * @curr_hold:    address of the hold TCB of the TCB list to be unlinked
  *
  * Return: 0 on success and error code otherwise.
  */
-int aipu_mm_unlink_tcb(struct aipu_memory_manager *mm, u64 curr_hold, bool free_tcb)
+int aipu_mm_unlink_tcb(struct aipu_memory_manager *mm, u64 curr_hold)
 {
 	struct aipu_tcb_buf *tbuf = NULL;
 	struct aipu_hold_tcb_buf *htbuf = NULL;
 	struct aipu_hold_tcb_buf *prev_htbuf = NULL;
-	struct aipu_buf_desc buf;
 	unsigned long flags;
 	int ret = 0;
 	u32 temp = 0;
@@ -2738,43 +1604,14 @@ int aipu_mm_unlink_tcb(struct aipu_memory_manager *mm, u64 curr_hold, bool free_
 
 unlock:
 	spin_unlock_irqrestore(&mm->shlock, flags);
-	if (!ret && free_tcb) {
-		memset(&buf, 0, sizeof(buf));
-		buf.pa = tbuf->head;
-		aipu_mm_free(mm, &buf, NULL, false);
-	}
 	htbuf->prev_tbuf = NULL;
 	return ret;
-}
-
-/**
- * @aipu_mm_pin_tcb() - pin a TCB list until it is ready to be freed in a future moment
- * @mm:   pointer to memory manager struct initialized in aipu_init_mm()
- * @tail: address of the tail TCB of a TCB list
- */
-void aipu_mm_pin_tcb(struct aipu_memory_manager *mm, u64 tail)
-{
-	struct aipu_tcb_buf *tbuf = NULL;
-	unsigned long flags;
-
-	spin_lock_irqsave(&mm->slock, flags);
-	tbuf = aipu_mm_find_tcb_buf_no_lock(mm, tail, NULL);
-	if (!tbuf)
-		goto unlock;
-
-	tbuf->pinned = true;
-
-unlock:
-	spin_unlock_irqrestore(&mm->slock, flags);
 }
 
 u64 aipu_mm_get_asid_base(struct aipu_memory_manager *mm, u32 asid)
 {
 	if (!mm || asid >= ZHOUYI_ASID_COUNT)
 		return 0;
-
-	if (mm->res_cnt)
-		return mm->ase[asid].base;
 
 	return mm->default_asid_base;
 }
@@ -2783,9 +1620,6 @@ u64 aipu_mm_get_asid_size(struct aipu_memory_manager *mm, u32 asid)
 {
 	if (!mm || asid >= ZHOUYI_ASID_COUNT)
 		return 0;
-
-	if (mm->res_cnt)
-		return mm->ase[asid].range;
 
 	return mm->default_asid_size;
 }
@@ -2849,28 +1683,6 @@ void aipu_mm_get_gm(struct aipu_memory_manager *mm, struct aipu_cap *cap)
 		cap->gm1_size = cap->gm0_size;
 	}
 	mutex_unlock(&mm->lock);
-}
-
-void get_dtcm(struct aipu_memory_manager *mm, u64 *base, u32 *size)
-{
-	struct aipu_mem_region *reg = NULL;
-	struct aipu_mem_region_obj *obj = NULL;
-
-	if (!mm || !base || !size || !mm->res_cnt)
-		return;
-
-	/* no lock because we only support reserved regions for DTCM */
-	list_for_each_entry(obj, &mm->mem.head->list, list) {
-		reg = obj->reg;
-		if (reg->type == AIPU_MEM_REGION_TYPE_DTCM) {
-			*base = reg->base_iova;
-			*size = reg->bytes;
-			return;
-		}
-	}
-
-	*base = 0;
-	*size = 0;
 }
 
 static void aipu_debug_print_buffers(struct aipu_memory_manager *mm)
@@ -3046,8 +1858,12 @@ static void riscv_invalidate_cache_range(void *vaddr, size_t size)
 	#error "Unsupported architecture."
 #endif
 
+/*
+ * not __init: this runs from probe, and once the module-global
+ * aipu clears on unbind, a re-bind reaches it again after .init.text is gone.
+ */
 // Initialize cache operation pointer
-static int __init init_cache_ops(struct aipu_memory_manager *mm)
+static int init_cache_ops(struct aipu_memory_manager *mm)
 {
 	struct __cache_ops *cache_ops = &mm->cache_ops;
 	cache_ops->cache_line_size = get_cache_line_size();
@@ -3119,7 +1935,7 @@ static struct aipu_iova_buffer *aipu_get_iova_buffer(struct aipu_memory_manager 
 	struct aipu_iova_buffer *buffer = NULL;
 
 	if (!mm) {
-		dev_err(mm->dev, "Invalid parameter to get iova buffer %s.\n", str);
+		pr_err("Invalid parameter to get iova buffer %s.\n", str);
 		return NULL;
 	}
 
@@ -3138,44 +1954,22 @@ static struct aipu_iova_buffer *aipu_get_iova_buffer(struct aipu_memory_manager 
 	return NULL;
 }
 
-struct aipu_phy_block *aipu_get_block_buffer(struct aipu_memory_manager *mm, u64 iova, char* str)
-{
-	struct aipu_iova_buffer *buffer;
-	struct aipu_phy_block *block;
-	bool find = false;
-
-	if (!mm) {
-		dev_err(mm->dev, "Invalid parameter to get iova buffer %s.\n", str);
-		return NULL;
-	}
-
-	mutex_lock(&mm->buffer_mutex);
-	list_for_each_entry(buffer, &mm->buffer_list, node) {
-		if ((iova - buffer->iova_start) < buffer->iova_size) {
-			find = true;
-			break;
-		}
-	}
-	mutex_unlock(&mm->buffer_mutex);
-
-	if (find) {
-		list_for_each_entry(block, &buffer->phy_blocks, list) {
-			if (block) {
-				if ((iova - block->iova_start) < block->size)
-					return block;
-			}
-		}
-	}
-
-	return NULL;
-}
+/*
+ * aipu_get_block_buffer() lived here. It dropped buffer_mutex before walking
+ * the buffer's phy_blocks, so both the buffer (kfree'd by
+ * aipu_mm_v3_destroy_buffer_now) and the list itself (mutated under
+ * phy_mutex by the same function) were unprotected across the walk. Its sole
+ * caller was the dma-buf exporter, which now uses aipu_mm_v3_find_block_by
+ * _iova -- the correct sibling, which holds buffer_mutex across the search
+ * and nests phy_mutex for the inner walk, and returns the same thing.
+ */
 
 static struct aipu_iova_buffer *aipu_get_iova_buffer_by_exec_id(struct aipu_memory_manager *mm, u64 exec_id, char* str)
 {
 	struct aipu_iova_buffer *buffer = NULL;
 
 	if (!mm) {
-		dev_err(mm->dev, "Invalid parameter to get iova buffer %s.\n", str);
+		pr_err("Invalid parameter to get iova buffer %s.\n", str);
 		return NULL;
 	}
 
@@ -3270,9 +2064,9 @@ static struct aipu_iova_buffer* aipu_alloc_iova(struct aipu_memory_manager *mm,
 		return NULL;
 	}
 
-	buf_req->desc.pa = iova_addr - mm->host_aipu_offset;
+	buf_req->desc.pa = iova_addr;
 	buf_req->desc.region = AIPU_BUF_REGION_DEFAULT;
-	buf_req->desc.dev_offset = iova_addr - mm->host_aipu_offset;
+	buf_req->desc.dev_offset = iova_addr;
 	buf_req->desc.asid = buf_req->asid;
 	buf_req->desc.bytes = (iova->pfn_hi - iova->pfn_lo + 1) << PAGE_SHIFT;
 	buf_req->desc.exec_id = buf_req->exec_id;
@@ -3283,7 +2077,7 @@ static struct aipu_iova_buffer* aipu_alloc_iova(struct aipu_memory_manager *mm,
 
 static void aipu_free_iova(struct aipu_memory_manager *mm, struct aipu_iova_buffer* buffer)
 {
-	unsigned long pfn_lo = (buffer->iova_start + mm->host_aipu_offset) >> PAGE_SHIFT;
+	unsigned long pfn_lo = buffer->iova_start >> PAGE_SHIFT;
 
 	mutex_lock(&mm->buffer_mutex);
 	if (buffer->ref_count) {
@@ -3528,10 +2322,22 @@ int aipu_alloc_dma_iova_phy(struct aipu_memory_manager *mm, struct aipu_buf_requ
 		return -EINVAL;
 
 	/* V3 + IOMMU with custom IOVA domain */
-	if (mm->version == AIPU_ISA_VERSION_ZHOUYI_V3 && 
+	if (mm->version == AIPU_ISA_VERSION_ZHOUYI_V3 &&
 	    mm->has_iommu && mm->use_v3_custom_iova) {
 		dev_dbg(mm->dev, "V3: alloc_dma_iova_phy mode=%d asid=%d bytes=0x%llx type=%d\n",
 			buf_req->alloc_mode, buf_req->asid, buf_req->bytes, buf_req->data_type);
+		/*
+		 * REQ_BUF reaches this custom-IOVA allocator directly, bypassing
+		 * aipu_mm_alloc's input validation. Re-assert the checks that
+		 * matter on this path: a zero-length request otherwise reaches
+		 * alloc_iova/iommu_map_sg with an inverted/empty range, and an
+		 * out-of-range ASID indexes mm->asid_iova out of bounds.
+		 */
+		if (!buf_req->bytes || buf_req->asid >= ZHOUYI_ASID_COUNT) {
+			dev_err(mm->dev, "V3: invalid alloc request: bytes 0x%llx asid %u\n",
+				buf_req->bytes, buf_req->asid);
+			return -EINVAL;
+		}
 		switch (buf_req->alloc_mode) {
 		case AIPU_DMA_BUF_MALLOC_DEFAULT:
 		case AIPU_DMA_BUF_MALLOC_IOVA_PHY:
@@ -3704,7 +2510,6 @@ OUT:
 	return ret;
 }
 
-
 /**
  * aipu_mm_v3_find_buffer_by_iova - Find IOVA buffer by IOVA
  * @mm: memory manager
@@ -3728,6 +2533,94 @@ static struct aipu_iova_buffer *aipu_mm_v3_find_buffer_by_iova(struct aipu_memor
 	mutex_unlock(&mm->buffer_mutex);
 
 	return NULL;
+}
+
+/**
+ * aipu_mm_v3_find_owned_buffer_by_iova - Find IOVA buffer, but only for its owner
+ * @mm: memory manager
+ * @iova: IOVA address
+ * @filp: the fd the caller is acting on behalf of
+ *
+ * The buffer_list is a single global list shared by every fd on the 0666 node,
+ * so resolving an address to a buffer proves nothing about who owns it. This
+ * variant returns the buffer only when it belongs to @filp, and is the gate for
+ * every user-facing operation that takes a caller-supplied address (free, mmap,
+ * cache flush/invalidate).
+ *
+ * @filp == NULL identifies the kernel itself as the owner and matches only
+ * buffers allocated with a NULL owner: the cross-fd hold-TCB pool and the
+ * dma-buf exporter's backing allocation, both of which outlive any single fd
+ * by construction and are reclaimed by their own paths. That regime is not
+ * reachable from userspace -- every ioctl and mmap entry point passes the
+ * caller's struct file, which the VFS guarantees is non-NULL -- so a user
+ * still cannot resolve a kernel-owned buffer.
+ * An earlier version expressed this as "reject NULL owners" and so refused the three
+ * in-kernel callers that use NULL as their identity: FREE_DMA_BUF, mmap of an
+ * exported dma-buf, and hold-TCB pool reclaim at deinit.
+ *
+ * Return: owned buffer pointer, or NULL when no buffer spans the IOVA or the
+ * spanning buffer belongs to a different owner.
+ */
+static struct aipu_iova_buffer *aipu_mm_v3_find_owned_buffer_by_iova(struct aipu_memory_manager *mm,
+								     u64 iova, struct file *filp)
+{
+	struct aipu_iova_buffer *buffer;
+
+	mutex_lock(&mm->buffer_mutex);
+	list_for_each_entry(buffer, &mm->buffer_list, node) {
+		if (iova < buffer->iova_start ||
+		    iova >= buffer->iova_start + buffer->iova_size)
+			continue;
+		if (buffer->filp == filp) {
+			mutex_unlock(&mm->buffer_mutex);
+			return buffer;
+		}
+		/* address resolves, but not to a buffer this owner may touch */
+		break;
+	}
+	mutex_unlock(&mm->buffer_mutex);
+
+	return NULL;
+}
+
+/**
+ * aipu_mm_v3_pa_owned_by - does an NPU-view PA fall inside a buffer owned by @filp?
+ * @mm: memory manager
+ * @pa: NPU-view physical address (asid_base + offset)
+ * @filp: the fd the caller is acting on behalf of
+ *
+ * The submit path uses this to reject job descriptors whose TCB addresses point
+ * outside the caller's own buffers before those addresses reach the TSM dispatch
+ * registers. Runs in process context only: it takes buffer_mutex,
+ * so it must not be called from the completion/dispatch path under manager->lock.
+ *
+ * Only the V3 custom-IOVA path is validated; on any other configuration this
+ * returns true (no per-fd IOVA buffers to check against).
+ *
+ * Return: true if @pa is owned by @filp (or validation does not apply), false
+ * if @pa resolves to no owned buffer.
+ */
+bool aipu_mm_v3_pa_owned_by(struct aipu_memory_manager *mm, u64 pa, struct file *filp)
+{
+	u64 iova;
+	u32 asid;
+
+	if (!mm || !filp)
+		return false;
+
+	if (!(mm->version == AIPU_ISA_VERSION_ZHOUYI_V3 &&
+	      mm->has_iommu && mm->use_v3_custom_iova))
+		return true;
+
+	for (asid = 0; asid < ZHOUYI_ASID_COUNT; asid++) {
+		iova = aipu_mm_v3_pa_to_iova(mm, pa, asid);
+		if (!iova)
+			continue;
+		if (aipu_mm_v3_find_owned_buffer_by_iova(mm, iova, filp))
+			return true;
+	}
+
+	return false;
 }
 
 /**
@@ -3775,10 +2668,10 @@ int aipu_free_dma_iova_phy(struct aipu_memory_manager *mm, struct aipu_buf_desc 
 			return -EINVAL;
 		}
 		
-		// Find and free buffer
-		buffer = aipu_mm_v3_find_buffer_by_iova(mm, iova);
+		// Find and free buffer -- only if this fd owns it
+		buffer = aipu_mm_v3_find_owned_buffer_by_iova(mm, iova, filp);
 		if (!buffer) {
-			dev_err(mm->dev, "V3: can't find buffer for IOVA 0x%llx (PA 0x%llx, ASID %d)\n",
+			dev_err(mm->dev, "V3: no owned buffer for IOVA 0x%llx (PA 0x%llx, ASID %d)\n",
 				iova, desc->pa, desc->asid);
 			return -EINVAL;
 		}
@@ -3787,22 +2680,15 @@ int aipu_free_dma_iova_phy(struct aipu_memory_manager *mm, struct aipu_buf_desc 
 		{
 			struct aipu_tcb_buf *tbuf;
 			unsigned long tflags;
-			bool had_tcb = false;
 
 			spin_lock_irqsave(&mm->slock, tflags);
 			tbuf = aipu_mm_v3_find_tcb_buf_no_lock(mm, desc->pa);
 			if (tbuf) {
-				had_tcb = true;
 				list_del(&tbuf->node);
 				kmem_cache_free(mm->tbuf_cache, tbuf);
 			}
 			spin_unlock_irqrestore(&mm->slock, tflags);
 
-			v3dbg(mm, "FREE_REQ    pa=0x%llx iova=0x%llx asid=%u dtype=%s(%u) exec=0x%llx is_tcb=%d ref=%d tgid=%d\n",
-			      desc->pa, iova, desc->asid,
-			      aipu_mm_v3_dtype_str(buffer->data_type),
-			      buffer->data_type, desc->exec_id, had_tcb,
-			      buffer->ref_count, task_tgid_nr(current));
 		}
 
 		aipu_mm_v3_free_iova_buffer(mm, buffer);
@@ -3871,10 +2757,39 @@ int aipu_rebind_dma_iova_phy(struct aipu_memory_manager *mm, struct aipu_rebind_
 	if (!mm || !desc)
 		return -EINVAL;
 
+	/*
+	 * REBIND_DMA_BUF is V3.2-shaped logic with no V3-custom branch, and on
+	 * custom-IOVA hardware it cannot do anything useful: it unmaps from the
+	 * driver's own domain (iommu_unmap on mm->iommu_domain) but re-maps
+	 * through aipu_map_sg_to_iommu, i.e. the DMA API, whose IOVAs come from
+	 * the kernel's default DMA-IOMMU cookie and fall outside every ASID
+	 * window -- the exact reason the import path was routed through
+	 * aipu_mm_v3_map_imported_sgt instead. A "successful" rebind therefore
+	 * returns an address the NPU cannot translate, leaks the new mapping
+	 * (nothing ever calls dma_unmap_sg, and the scatterlist an unmap would
+	 * need is freed immediately after mapping), and on a short unmap leaks
+	 * the block itself, which has already been unlinked from its buffer.
+	 *
+	 * Refuse the command rather than write a custom-domain rebind that does
+	 * not exist: the treatment BIND_DMA_BUF already has.
+	 */
+	if (mm->version == AIPU_ISA_VERSION_ZHOUYI_V3 &&
+	    mm->has_iommu && mm->use_v3_custom_iova) {
+		dev_err_once(mm->dev,
+			     "REBIND_DMA_BUF is not supported on V3 custom-IOVA hardware\n");
+		return -EINVAL;
+	}
+
 	//handle before iova buffer;
 	buffer = aipu_get_iova_buffer(mm, pa_unmap, "rebind dma buffer");
 	if (!buffer) {
 		dev_err(mm->dev, "Cant find iova buffer 0x%llx.\n", desc->pa_unmap);
+		return -EINVAL;
+	}
+
+	/* refuse to re-home a buffer this fd does not own */
+	if (!buffer->filp || buffer->filp != filp) {
+		dev_err(mm->dev, "rebind: buffer 0x%llx not owned by caller\n", desc->pa_unmap);
 		return -EINVAL;
 	}
 
@@ -3961,10 +2876,6 @@ int aipu_mm_v3_init_iova_domain(struct aipu_memory_manager *mm)
 		/* NPU view base: 0, 4GB, 8GB, 12GB for ASID 0-3 */
 		mm->asid_iova[asid].asid_base = (u64)asid * V3_ASID_SLOT_SIZE;
 
-		/* Set mm->ase[asid].base so aipu_mm_get_asid_base() returns correct value to UMD */
-		mm->ase[asid].base = mm->asid_iova[asid].asid_base;
-		mm->ase[asid].range = V3_ASID_USABLE_SIZE;
-
 		dev_dbg(mm->dev, "V3 ASID %d: IOVA [0x%llx, 0x%llx), NPU base 0x%llx\n",
 			asid, mm->asid_iova[asid].iova_base,
 			mm->asid_iova[asid].iova_base + V3_ASID_USABLE_SIZE,
@@ -3997,7 +2908,6 @@ int aipu_mm_v3_init_iova_domain(struct aipu_memory_manager *mm)
 	mutex_init(&mm->buffer_mutex);
 	spin_lock_init(&mm->asid_lock);
 	INIT_LIST_HEAD(&mm->buffer_list);
-	mm->host_aipu_offset = 0;
 	/* 16GB total IOVA needs 34-bit DMA mask */
 	mm->dma_mask = 34;
 	init_cache_ops(mm);
@@ -4081,7 +2991,6 @@ void aipu_mm_v3_deinit_iova_domain(struct aipu_memory_manager *mm)
 	put_iova_domain(&mm->iova_domain);
 	mm->use_v3_custom_iova = false;
 }
-
 
 /*
  * aipu_mm_v3_dump_asid_state - dump per-ASID accounting summary.
@@ -4258,14 +3167,24 @@ struct aipu_iova_buffer *aipu_mm_v3_alloc_iova(struct aipu_memory_manager *mm,
 	 * by aipu_mm_hold_tcb_buf_free, NOT by aipu_mm_v3_free_buffers_by_filp
 	 * (which can never match a NULL filp).
 	 *
-	 * Any NEW caller passing filp==NULL with non-TCB data_type would
+	 * The dma-buf exporter (aipu_alloc_dma_buf) is the second such caller,
+	 * and equally deliberate: an exported buffer is owned by the dma_buf's
+	 * refcount, not by the fd that asked for it, because the fd may be
+	 * passed to another process or closed while importers still hold it.
+	 * It reclaims in aipu_dma_release and marks itself with the private
+	 * AIPU_MM_DATA_TYPE_KMD_DMA_BUF so it can be told apart here. While it
+	 * had no reclaim path at all, this tripwire fired on
+	 * every shipped workload, correctly.
+	 *
+	 * Any NEW caller passing filp==NULL without naming itself would
 	 * silently leak iova_used for the module lifetime — guard against
 	 * that here so the leak is observable in dmesg.
 	 */
-	WARN_ONCE(!filp && buf_req->data_type != AIPU_MM_DATA_TYPE_TCB,
-		"aipu_mm: V3 IOVA alloc filp==NULL with data_type=%d (expected %d=TCB) "
+	WARN_ONCE(!filp && buf_req->data_type != AIPU_MM_DATA_TYPE_TCB &&
+		  buf_req->data_type != AIPU_MM_DATA_TYPE_KMD_DMA_BUF,
+		"aipu_mm: V3 IOVA alloc filp==NULL with unclaimed data_type=%d "
 		"asid=%d size=0x%llx — caller will leak iova_used until module deinit\n",
-		buf_req->data_type, AIPU_MM_DATA_TYPE_TCB, asid, iova_size);
+		buf_req->data_type, asid, iova_size);
 	buffer->filp = filp;
 	buffer->tgid = task_tgid_nr(current);
 	buffer->pid = task_pid_nr(current);
@@ -4289,11 +3208,6 @@ struct aipu_iova_buffer *aipu_mm_v3_alloc_iova(struct aipu_memory_manager *mm,
 
 	dev_dbg(mm->dev, "V3: allocated IOVA 0x%llx size 0x%llx for ASID %d\n",
 		buffer->iova_start, iova_size, asid);
-
-	v3dbg(mm, "ALLOC_IOVA  iova[0x%llx-0x%llx) size=0x%llx asid=%u dtype=%s(%u) exec=0x%llx tgid=%d pid=%d\n",
-	      buffer->iova_start, buffer->iova_start + buffer->iova_size,
-	      buffer->iova_size, asid, aipu_mm_v3_dtype_str(buffer->data_type),
-	      buffer->data_type, buffer->exec_id, buffer->tgid, buffer->pid);
 
 	return buffer;
 
@@ -4425,32 +3339,41 @@ int aipu_mm_v3_alloc_phy_and_map(struct aipu_memory_manager *mm,
 			ret = -ENOMEM;
 			goto err_free_sg;
 		}
-		v3dbg(mm, "MAP         iova[0x%llx-0x%llx) size=0x%llx mapped=0x%zx%s pages=%u tgid=%d\n",
-		      iova_addr, iova_addr + block->size, block->size, (size_t)mapped,
-		      (mapped != (ssize_t)block->size) ? " PARTIAL!" : "",
-		      page_count, task_tgid_nr(current));
 	}
 
 	block->iova_start = iova_addr;
 	block->dma_addr = iova_addr;
 
-	/* Map kernel virtual address for cache operations */
-	/* Use noncached mapping for DMA coherency with NPU hardware */
-	block->va = vmap(block->pages, page_count, VM_MAP,
-			 pgprot_noncached(PAGE_KERNEL));
-	if (!block->va) {
-		/* vmap failure must propagate as -ENOMEM.
-		 * If a hold-TCB-class buffer ends up with kva == NULL,
-		 * a subsequent aipu_mm_link_tcb dereferences kva under
-		 * mm->shlock and OOPSes the kernel with a spinlock held.
-		 * Unwind the IOMMU map, SG table, pages, and block, then
-		 * return -ENOMEM so the caller's existing rollback runs.
-		 */
-		dev_err(mm->dev,
-			"V3: vmap failed for IOVA 0x%llx size 0x%llx\n",
-			iova_addr, block->size);
-		ret = -ENOMEM;
-		goto err_iommu_unmap;
+	/* Map a kernel alias only for the classes that read block->va:
+	 * TCB buffers (the TCB accessors, and aipu_mm_link_tcb dereferences
+	 * kva under mm->shlock) and dma-buf exports (priv->va feeds the
+	 * dma_buf vmap hook and aipu_alloc_dma_buf fails without it). Every
+	 * other class -- text, weights, feature maps -- paid vmalloc space
+	 * and kernel PTEs for an alias nothing reads: ~0.5 GB per live graph,
+	 * measured. A va-less block degrades the cache
+	 * ioctls to a no-op success (the user mapping is Normal-NC, so there
+	 * is no dirty line to maintain) and real-time printk logs and skips
+	 * a print buffer it cannot reach.
+	 */
+	if (buf_req->data_type == AIPU_MM_DATA_TYPE_TCB ||
+	    buf_req->data_type == AIPU_MM_DATA_TYPE_KMD_DMA_BUF) {
+		block->va = vmap(block->pages, page_count, VM_MAP,
+				 pgprot_noncached(PAGE_KERNEL));
+		if (!block->va) {
+			/* vmap failure must propagate as -ENOMEM.
+			 * If a hold-TCB-class buffer ends up with kva == NULL,
+			 * a subsequent aipu_mm_link_tcb dereferences kva under
+			 * mm->shlock and OOPSes the kernel with a spinlock
+			 * held. Unwind the IOMMU map, SG table, pages, and
+			 * block, then return -ENOMEM so the caller's existing
+			 * rollback runs.
+			 */
+			dev_err(mm->dev,
+				"V3: vmap failed for IOVA 0x%llx size 0x%llx\n",
+				iova_addr, block->size);
+			ret = -ENOMEM;
+			goto err_iommu_unmap;
+		}
 	}
 
 	/* Add block to buffer */
@@ -4489,7 +3412,6 @@ err_free_block:
 	kfree(block);
 	return ret;
 }
-
 
 /**
  * aipu_mm_v3_find_block_by_iova - Find physical block by IOVA address
@@ -4532,88 +3454,6 @@ struct aipu_phy_block *aipu_mm_v3_find_block_by_iova(struct aipu_memory_manager 
 
 	return NULL;
 }
-
-/**
- * aipu_mm_v3_buffer_npu_writes - true if NPU may have DMA-written this buffer
- * @data_type: the enum aipu_mm_data_type stored at allocation time
- *
- * Post-job we only need to "dc civac" buffers the NPU has actually written:
- * the goal is to drop any speculative Normal-Cacheable lines so the CPU
- * sees the NPU's DMA writes. Buffers the NPU only reads (program text,
- * read-only parameters, static weights) already saw a clean+invalidate at
- * allocation time (alloc_phy_and_map), are never overwritten by the CPU
- * through the cacheable alias afterwards, and the NPU does not modify
- * their contents -- so flushing them every inference is pure waste.
- *
- * Conservative side (return true):
- *   REUSE -- feature maps / activations / outputs: written by NPU.
- *   STACK -- scratch the NPU writes during execution.
- *   TCB   -- command descriptors; NPU writes job status fields.
- *   NONE  -- unclassified caller (e.g. legacy paths); flush to stay safe.
- * Skipped (return false):
- *   TEXT, RODATA, STATIC, WEIGHT -- NPU-read-only by construction.
- */
-static bool aipu_mm_v3_buffer_npu_writes(u8 data_type)
-{
-	switch (data_type) {
-	case AIPU_MM_DATA_TYPE_TEXT:
-	case AIPU_MM_DATA_TYPE_RODATA:
-	case AIPU_MM_DATA_TYPE_STATIC:
-	case AIPU_MM_DATA_TYPE_WEIGHT:
-		return false;
-	default:
-		return true;
-	}
-}
-
-/**
- * aipu_mm_v3_flush_all_for_filp - Flush all V3 custom IOVA buffers for a filp
- * @mm: memory manager
- * @filp: file pointer identifying the process
- *
- * Ensures cache coherency for all DMA buffers belonging to this filp.
- * Called after NPU job completion to ensure CPU sees NPU DMA writes.
- * Uses page_address() (Normal Cacheable linear mapping) for cache maintenance,
- * since DC operations on Device-mapped VA are CONSTRAINED UNPREDICTABLE on ARM64.
- *
- * Skips NPU-read-only buffer classes (text/rodata/static/weight). For a
- * typical inference those dominate working-set size; flushing them post-job
- * is wasted work -- the NPU never writes them, so there are no fresh DMA
- * writes that the CPU could miss, and they were already clean+invalidated
- * at allocation time when __GFP_ZERO dirtied them.
- */
-void aipu_mm_v3_flush_all_for_filp(struct aipu_memory_manager *mm, struct file *filp)
-{
-	struct aipu_iova_buffer *buffer;
-	struct aipu_phy_block *block;
-
-	if (!mm || !filp || !mm->use_v3_custom_iova)
-		return;
-
-	dsb(sy);
-
-	mutex_lock(&mm->buffer_mutex);
-	list_for_each_entry(buffer, &mm->buffer_list, node) {
-		if (buffer->filp != filp)
-			continue;
-		if (!aipu_mm_v3_buffer_npu_writes(buffer->data_type))
-			continue;
-
-		mutex_lock(&buffer->phy_mutex);
-		list_for_each_entry(block, &buffer->phy_blocks, list) {
-			/*
-			 * No per-page barrier: the single trailing dsb(sy)
-			 * below completes all the dc ops issued in this walk.
-			 */
-			aipu_mm_v3_flush_block_pages_nb(mm, block);
-		}
-		mutex_unlock(&buffer->phy_mutex);
-	}
-	mutex_unlock(&mm->buffer_mutex);
-
-	dsb(sy);
-}
-
 
 /**
  * aipu_mm_v3_pa_to_iova - Convert device PA to IOVA
@@ -4885,13 +3725,6 @@ void aipu_mm_v3_destroy_buffer_now(struct aipu_memory_manager *mm,
 						 block->iova_start, block->size);
 			(void)_un;
 
-			v3dbg(mm, "UNMAP       iova[0x%llx-0x%llx) size=0x%llx unmapped=0x%zx%s asid=%u dtype=%s(%u) ref=%d exec=0x%llx tgid=%d\n",
-			      block->iova_start, block->iova_start + block->size,
-			      block->size, _un,
-			      (_un != block->size) ? " SHORT!" : "",
-			      buffer->asid, aipu_mm_v3_dtype_str(buffer->data_type),
-			      buffer->data_type, buffer->ref_count, buffer->exec_id,
-			      buffer->tgid);
 		}
 
 		if (block->va)
@@ -4966,13 +3799,14 @@ void aipu_mm_v3_free_iova_buffer(struct aipu_memory_manager *mm,
  *
  * Called when fd is closed
  *
- * Buffers with buffer->filp == NULL (hold-TCB cross-fd
- * allocations from aipu_mm_hold_tcb_buf_alloc) are intentionally NOT
- * reclaimed here — they are module-lifetime and reclaimed in
- * aipu_mm_hold_tcb_buf_free at deinit. The filp != NULL guard at entry
- * and the buffer->filp == filp comparison both implicitly skip them;
- * the WARN_ONCE in aipu_mm_v3_alloc_iova catches any new caller that
- * accidentally enters this regime with a non-TCB data_type.
+ * Buffers with buffer->filp == NULL are intentionally NOT
+ * reclaimed here: the hold-TCB cross-fd pool (aipu_mm_hold_tcb_buf_alloc),
+ * reclaimed at deinit by aipu_mm_hold_tcb_buf_free, and the dma-buf
+ * exporter's backing allocation (aipu_alloc_dma_buf), reclaimed by the
+ * export's own refcount in aipu_dma_release. The filp != NULL guard at
+ * entry keeps both out of this sweep; the WARN_ONCE in
+ * aipu_mm_v3_alloc_iova catches any new caller that enters the NULL-owner
+ * regime without naming itself and so has no reclaim path at all.
  */
 void aipu_mm_v3_free_buffers_by_filp(struct aipu_memory_manager *mm,
 					     struct file *filp)

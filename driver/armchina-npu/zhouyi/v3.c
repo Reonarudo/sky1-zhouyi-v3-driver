@@ -13,24 +13,29 @@
 
 static void zhouyi_v3_set_partition(struct aipu_partition *partition, u32 cluster_id)
 {
-	u32 nums = GET_NUMS(aipu_read32(partition->reg, CLUSTER_CONFIG_REG(cluster_id)));
+	u32 val = 0;
 
+	aipu_read32(partition->reg, CLUSTER_CONFIG_REG(cluster_id), &val);
 	aipu_write32(partition->reg, CLUSTER_CONTROL_REG(cluster_id),
-		     ENABLE_CLUSTER(partition->id, nums));
+		     ENABLE_CLUSTER(partition->id, GET_NUMS(val)));
 }
 
 static void zhouyi_v3_enable_core_cnt(struct aipu_partition *partition, u32 cluster_id,
 				      u32 en_core_cnt)
 {
-	u32 nums = GET_NUMS(aipu_read32(partition->reg, CLUSTER_CONFIG_REG(cluster_id)));
-	u32 en_aiff_cnt = GET_AIFF_NUM(nums);
-	u32 en_tec_cnt = GET_TEC_NUM(nums);
-	u32 config = CONFIG_CLUSTER(partition->id, en_core_cnt, en_aiff_cnt, en_tec_cnt);
+	u32 val = 0;
+	u32 nums = 0;
+	u32 config = 0;
 	u32 status = 0;
+
+	aipu_read32(partition->reg, CLUSTER_CONFIG_REG(cluster_id), &val);
+	nums = GET_NUMS(val);
+	config = CONFIG_CLUSTER(partition->id, en_core_cnt, GET_AIFF_NUM(nums),
+				GET_TEC_NUM(nums));
 
 	aipu_write32(partition->reg, CLUSTER_CONTROL_REG(cluster_id), config);
 
-	status = aipu_read32(partition->reg, TSM_STATUS_REG);
+	aipu_read32(partition->reg, TSM_STATUS_REG, &status);
 	if (!en_core_cnt && IS_CMD_FAIL(status))
 		aipu_write32(partition->reg, TSM_STATUS_REG, CLEAR_CMD_FAIL(status));
 
@@ -87,7 +92,7 @@ static int zhouyi_v3_destroy_create_command_pool(struct aipu_partition *partitio
 
 	zhouyi_v3_destroy_command_pool_internal(partition);
 
-	status = aipu_read32(partition->reg, TSM_STATUS_REG);
+	aipu_read32(partition->reg, TSM_STATUS_REG, &status);
 	if (IS_CMD_FAIL(status)) {
 		aipu_write32(partition->reg, TSM_STATUS_REG, CLEAR_CMD_FAIL(status));
 		dev_err(partition->dev, "destroy-create command pool #%d failed: destroy\n",
@@ -98,7 +103,7 @@ static int zhouyi_v3_destroy_create_command_pool(struct aipu_partition *partitio
 	aipu_write32(partition->reg, TSM_CMD_SCHD_CTRL_HANDLE_REG,
 		     TSM_CREATE_CMD_POOL(partition->id, TSM_MAP_ALL));
 
-	status = aipu_read32(partition->reg, TSM_STATUS_REG);
+	aipu_read32(partition->reg, TSM_STATUS_REG, &status);
 	if (IS_CMD_FAIL(status)) {
 		dev_err(partition->dev, "destroy-create command pool #%d failed: create\n",
 			partition->id);
@@ -113,15 +118,17 @@ static int zhouyi_v3_destroy_create_command_pool(struct aipu_partition *partitio
 static int zhouyi_v3_create_command_pool(struct aipu_partition *partition)
 {
 	u32 status = 0;
+	u32 pool_status = 0;
 	int ret = 0;
 
-	if (IS_CMD_POOL_BUSY(aipu_read32(partition->reg, CMD_POOL_STATUS_REG(partition->id))))
+	aipu_read32(partition->reg, CMD_POOL_STATUS_REG(partition->id), &pool_status);
+	if (IS_CMD_POOL_BUSY(pool_status))
 		return ret;
 
 	aipu_write32(partition->reg, TSM_CMD_SCHD_CTRL_HANDLE_REG,
 		     TSM_CREATE_CMD_POOL(partition->id, TSM_MAP_ALL));
 
-	status = aipu_read32(partition->reg, TSM_STATUS_REG);
+	aipu_read32(partition->reg, TSM_STATUS_REG, &status);
 	if (IS_CMD_FAIL(status)) {
 		dev_dbg(partition->dev, "create command pool #%d failed, try to destroy-create\n",
 			partition->id);
@@ -142,7 +149,7 @@ static int zhouyi_v3_abort_command_pool(struct aipu_partition *partition, int po
 	aipu_write32(partition->reg, TSM_CMD_SCHD_CTRL_HANDLE_REG,
 		     TSM_ABORT_CMD_POOL(partition->id));
 
-	status = aipu_read32(partition->reg, TSM_STATUS_REG);
+	aipu_read32(partition->reg, TSM_STATUS_REG, &status);
 	if (IS_CMD_FAIL(status)) {
 		dev_err(partition->dev, "abort command pool #%d failed (cmd 0x%x)\n",
 			partition->id, TSM_ABORT_CMD_POOL(partition->id));
@@ -160,12 +167,12 @@ static int zhouyi_v3_destroy_command_pool(struct aipu_partition *partition, int 
 	u32 status = 0;
 
 	zhouyi_v3_destroy_command_pool_internal(partition);
-	status = aipu_read32(partition->reg, TSM_STATUS_REG);
+	aipu_read32(partition->reg, TSM_STATUS_REG, &status);
 	if (IS_CMD_FAIL(status)) {
 		aipu_write32(partition->reg, TSM_STATUS_REG, CLEAR_CMD_FAIL(status));
 		zhouyi_v3_abort_command_pool(partition, ZHOUYI_COMMAND_POOL_DEFAULT);
 		zhouyi_v3_destroy_command_pool_internal(partition);
-		status = aipu_read32(partition->reg, TSM_STATUS_REG);
+		aipu_read32(partition->reg, TSM_STATUS_REG, &status);
 		if (IS_CMD_FAIL(status)) {
 			aipu_write32(partition->reg, TSM_STATUS_REG, CLEAR_CMD_FAIL(status));
 			return -EFAULT;
@@ -182,15 +189,32 @@ static int zhouyi_v3_reserve(struct aipu_partition *partition, struct aipu_job_d
 			     int trigger_type, int pool)
 {
 	int ret = 0;
+	u32 status = 0;
+	u32 intr_ctrl = 0;
 
 	if (unlikely(!partition || !udesc))
 		return -EINVAL;
+
+	/*
+	 * Tripwire: runtime resume restores this mask and
+	 * disable_interrupt has no callers, so zero here means something
+	 * not yet identified cleared it (power-down is not proven to be
+	 * the only cause). Repair, but loudly, so it shows in dmesg.
+	 */
+	aipu_read32(partition->reg, CMD_POOL_INTR_CTRL_REG(partition->id), &intr_ctrl);
+	if (unlikely(!intr_ctrl)) {
+		dev_err(partition->dev,
+			"cmd pool #%d intr mask found cleared at dispatch: re-arming\n",
+			partition->id);
+		zhouyi_v3_enable_interrupt(partition, false);
+	}
 
 	ret = zhouyi_v3_create_command_pool(partition);
 	if (ret)
 		return ret;
 
-	if (IS_CMD_POOL_IDLE(aipu_read32(partition->reg, CMD_POOL_STATUS_REG(partition->id)))) {
+	aipu_read32(partition->reg, CMD_POOL_STATUS_REG(partition->id), &status);
+	if (IS_CMD_POOL_IDLE(status)) {
 		dev_err(partition->dev, "create command pool #%d failed (pool idle)\n",
 			partition->id);
 		return -EFAULT;
@@ -221,7 +245,8 @@ static int zhouyi_v3_reserve(struct aipu_partition *partition, struct aipu_job_d
 			udesc->last_task_tcb_pa);
 	}
 
-	if (IS_CMD_FAIL(aipu_read32(partition->reg, TSM_STATUS_REG))) {
+	aipu_read32(partition->reg, TSM_STATUS_REG, &status);
+	if (IS_CMD_FAIL(status)) {
 		dev_err(partition->dev, "dispatch command failed: job tail 0x%llx\n",
 			udesc->tail_tcb_pa);
 		return -EFAULT;
@@ -232,10 +257,13 @@ static int zhouyi_v3_reserve(struct aipu_partition *partition, struct aipu_job_d
 
 static int zhouyi_v3_exit_dispatch(struct aipu_partition *partition, u32 job_flag, u64 tcb_pa)
 {
+	u32 status = 0;
+
 	aipu_write32(partition->reg, TSM_CMD_SCHD_CTRL_HANDLE_REG,
 		     TSM_DISPATCH_CMD_POOL(partition->id, get_qos(job_flag)));
 
-	if (IS_CMD_FAIL(aipu_read32(partition->reg, TSM_STATUS_REG))) {
+	aipu_read32(partition->reg, TSM_STATUS_REG, &status);
+	if (IS_CMD_FAIL(status)) {
 		dev_err(partition->dev, "dispatch init TCB failed: job tail 0x%llx\n",
 			tcb_pa);
 		return -EFAULT;
@@ -247,7 +275,10 @@ static int zhouyi_v3_exit_dispatch(struct aipu_partition *partition, u32 job_fla
 
 static bool zhouyi_v3_is_idle(struct aipu_partition *partition)
 {
-	return !IS_CMD_POOL_FULL(aipu_read32(partition->reg, TSM_STATUS_REG));
+	u32 status = 0;
+
+	aipu_read32(partition->reg, TSM_STATUS_REG, &status);
+	return !IS_CMD_POOL_FULL(status);
 }
 
 static void zhouyi_v3_print_hw_id_info(struct aipu_partition *partition)
@@ -282,8 +313,26 @@ static int zhouyi_v3_io_rw(struct aipu_partition *partition, struct aipu_io_req 
 	if (!partition || io_req->offset > ZHOUYI_V3_MAX_REG_OFFSET)
 		return -EINVAL;
 
-	zhouyi_io_rw(partition->reg, io_req);
-	return 0;
+	/*
+	 * the registers are word-sized: an odd offset reaches
+	 * readl/writel on a Device-nGnRE mapping as an unaligned access --
+	 * a synchronous external abort on arm64, from a 0666 node.
+	 * The sysfs store path always had this check; the ioctl did not.
+	 */
+	if (io_req->offset & 0x3)
+		return -EINVAL;
+
+	/*
+	 * nothing ever read reg_type: a caller asking for the
+	 * debug window silently got the host window at the same offset.
+	 * No debug window exists (the never-populated dbg_reg
+	 * fields were deleted as dead weight), so refuse rather than
+	 * pretend.
+	 */
+	if (io_req->reg_type != AIPU_HOST_REG)
+		return -EINVAL;
+
+	return zhouyi_io_rw(partition->reg, io_req);
 }
 
 static void zhouyi_v3_disable_tick_counter(struct aipu_partition *partition)
@@ -308,36 +357,45 @@ static void zhouyi_v3_initialize(struct aipu_partition *partition)
 	zhouyi_v3_disable_tick_counter(partition);
 }
 
-static int partition_upper_half(struct aipu_partition *partition)
+static irqreturn_t partition_upper_half(struct aipu_partition *partition)
 {
 	struct aipu_priv *aipu = partition->priv;
-	u32 i = 0;
 	struct job_irq_info info;
 	u32 status = 0;
 	u32 tag_id = 0;
+	u32 val = 0;
+	u32 tick_hi = 0;
+	u32 tick_lo = 0;
 	u16 sig_num = 0;
 
-	for (i = 0; i < aipu->partition_cnt; i++) {
-		partition = &aipu->partitions[i];
-		status = aipu_read32(&aipu->reg, CMD_POOL_INTR_STATUS_REG(partition->id));
-		if (IS_CMD_POOL_IRQ(status))
-			break;
-	}
-
+	/*
+	 * this used to ignore its argument and rescan every
+	 * partition itself (N² scans per interrupt, and the loop left
+	 * `partition` pointing at the last entry when nothing matched);
+	 * the caller owns the loop now. On a shared line, "nothing
+	 * to handle" must be IRQ_NONE, not IRQ_HANDLED, or the kernel can
+	 * neither route the interrupt to its real owner nor detect a
+	 * screaming line.
+	 */
+	aipu_read32(&aipu->reg, CMD_POOL_INTR_STATUS_REG(partition->id), &status);
 	if (!IS_IRQ_TO_HANDLE(status))
-		return IRQ_HANDLED;
+		return IRQ_NONE;
 
-	sig_num = GET_IRQ_SIGNAL_NUM(aipu_read32(&aipu->reg, CMD_POOL_IRQ_SIG_REG(partition->id)));
-	info.tail_tcbp = aipu_read32(&aipu->reg, CMD_POOL_INTR_TCB_PTR_REG(partition->id));
-	info.sig_flag = aipu_read32(&aipu->reg, CMD_POOL_IRQ_SIGNAL_FLAG_REG(partition->id));
-	info.tick_counter = ((u64)aipu_read32(&aipu->reg, TICK_COUNTER_HIGH_REG) << 32) +
-		aipu_read32(&aipu->reg, TICK_COUNTER_LOW_REG);
+	aipu_read32(&aipu->reg, CMD_POOL_IRQ_SIG_REG(partition->id), &val);
+	sig_num = GET_IRQ_SIGNAL_NUM(val);
+	aipu_read32(&aipu->reg, CMD_POOL_INTR_TCB_PTR_REG(partition->id), &val);
+	info.tail_tcbp = val;
+	aipu_read32(&aipu->reg, CMD_POOL_IRQ_SIGNAL_FLAG_REG(partition->id), &val);
+	info.sig_flag = val;
+	aipu_read32(&aipu->reg, TICK_COUNTER_HIGH_REG, &tick_hi);
+	aipu_read32(&aipu->reg, TICK_COUNTER_LOW_REG, &tick_lo);
+	info.tick_counter = ((u64)tick_hi << 32) + tick_lo;
 	info.cluster_id = GET_INTR_CLUSTER_ID(status);
 	info.core_id = GET_INTR_CORE_ID(status);
 	info.tec_id = GET_INTR_TEC_ID(status);
 
 	if (IS_ABNORMAL(status)) {
-		tag_id = aipu_read32(partition->reg, CMD_POOL_FIRST_BAD_CMD_REG(partition->id));
+		aipu_read32(partition->reg, CMD_POOL_FIRST_BAD_CMD_REG(partition->id), &tag_id);
 		info.tag_id = IS_BAD_TAG_ID_VALID(tag_id) ? GET_FIRST_BAD_TAG_ID(tag_id) : 0;
 		aipu_write32(partition->reg, CMD_POOL_FIRST_BAD_CMD_REG(partition->id), 0);
 	} else {
@@ -375,16 +433,19 @@ static int partition_upper_half(struct aipu_partition *partition)
 	return IRQ_HANDLED;
 }
 
-static int zhouyi_v3_upper_half(void *data)
+static irqreturn_t zhouyi_v3_upper_half(void *data)
 {
 	struct aipu_partition *partition = (struct aipu_partition *)data;
 	struct aipu_priv *aipu = partition->priv;
+	irqreturn_t ret = IRQ_NONE;
 	int iter = 0;
 
-	for (iter = 0; iter < aipu->partition_cnt; iter++)
-		partition_upper_half(&aipu->partitions[iter]);
+	for (iter = 0; iter < aipu->partition_cnt; iter++) {
+		if (partition_upper_half(&aipu->partitions[iter]) == IRQ_HANDLED)
+			ret = IRQ_HANDLED;
+	}
 
-	return IRQ_HANDLED;
+	return ret;
 }
 
 static void zhouyi_v3_bottom_half(void *data)
@@ -392,80 +453,57 @@ static void zhouyi_v3_bottom_half(void *data)
 	aipu_job_manager_irq_bottom_half(data);
 }
 
-static int zhouyi_v3_sysfs_show(struct aipu_partition *partition, char *buf)
+static int zhouyi_v3_sysfs_show(struct aipu_partition *partition, char *buf, int len)
 {
 	int ret = 0;
-	char tmp[512];
 
 	if (unlikely(!partition || !buf))
-		return -EINVAL;
+		return 0;
 
-	ret += zhouyi_print_reg_info(partition->reg, tmp, "Cluster config",
+	ret += zhouyi_print_reg_info(partition->reg, buf, len + ret, "Cluster config",
 				     CLUSTER_CONFIG_REG(0));
-	strcat(buf, tmp);
-	ret += zhouyi_print_reg_info(partition->reg, tmp, "Cluster control",
+	ret += zhouyi_print_reg_info(partition->reg, buf, len + ret, "Cluster control",
 				     CLUSTER_CONTROL_REG(0));
-	strcat(buf, tmp);
-	ret += zhouyi_print_reg_info(partition->reg, tmp, "TSM schedule ctrl handle",
+	ret += zhouyi_print_reg_info(partition->reg, buf, len + ret, "TSM schedule ctrl handle",
 				     TSM_CMD_SCHD_CTRL_HANDLE_REG);
-	strcat(buf, tmp);
-	ret += zhouyi_print_reg_info(partition->reg, tmp, "TSM schedule ctrl info",
+	ret += zhouyi_print_reg_info(partition->reg, buf, len + ret, "TSM schedule ctrl info",
 				     TSM_CMD_SCHD_CTRL_INFO_REG);
-	strcat(buf, tmp);
-	ret += zhouyi_print_reg_info(partition->reg, tmp, "TSM schedule addr high",
+	ret += zhouyi_print_reg_info(partition->reg, buf, len + ret, "TSM schedule addr high",
 				     TSM_CMD_SCHD_ADDR_HIGH_REG);
-	strcat(buf, tmp);
-	ret += zhouyi_print_reg_info(partition->reg, tmp, "TSM schedule addr low",
+	ret += zhouyi_print_reg_info(partition->reg, buf, len + ret, "TSM schedule addr low",
 				     TSM_CMD_SCHD_ADDR_LOW_REG);
-	strcat(buf, tmp);
-	ret += zhouyi_print_reg_info(partition->reg, tmp, "TSM config",
+	ret += zhouyi_print_reg_info(partition->reg, buf, len + ret, "TSM config",
 				     TSM_CONFIG_REG);
-	strcat(buf, tmp);
-	ret += zhouyi_print_reg_info(partition->reg, tmp, "TSM build info",
+	ret += zhouyi_print_reg_info(partition->reg, buf, len + ret, "TSM build info",
 				     TSM_BUILD_INFO_REG);
-	strcat(buf, tmp);
-	ret += zhouyi_print_reg_info(partition->reg, tmp, "TSM status",
+	ret += zhouyi_print_reg_info(partition->reg, buf, len + ret, "TSM status",
 				     TSM_STATUS_REG);
-	strcat(buf, tmp);
-	ret += zhouyi_print_reg_info(partition->reg, tmp, "TSM soft reset",
+	ret += zhouyi_print_reg_info(partition->reg, buf, len + ret, "TSM soft reset",
 				     TSM_SOFT_RESET_REG);
-	strcat(buf, tmp);
-	ret += zhouyi_print_reg_info(partition->reg, tmp, "TSM revision",
+	ret += zhouyi_print_reg_info(partition->reg, buf, len + ret, "TSM revision",
 				     TSM_REVISION_REG);
-	strcat(buf, tmp);
-	ret += zhouyi_print_reg_info(partition->reg, tmp, "Tick counter high",
+	ret += zhouyi_print_reg_info(partition->reg, buf, len + ret, "Tick counter high",
 				     TICK_COUNTER_HIGH_REG);
-	strcat(buf, tmp);
-	ret += zhouyi_print_reg_info(partition->reg, tmp, "Tick counter low",
+	ret += zhouyi_print_reg_info(partition->reg, buf, len + ret, "Tick counter low",
 				     TICK_COUNTER_LOW_REG);
-	strcat(buf, tmp);
-	ret += zhouyi_print_reg_info(partition->reg, tmp, "Tick counter control",
+	ret += zhouyi_print_reg_info(partition->reg, buf, len + ret, "Tick counter control",
 				     TICK_COUNTER_CONTROL_STATUS_REG);
-	strcat(buf, tmp);
-	ret += zhouyi_print_reg_info(partition->reg, tmp, "CMD pool config",
+	ret += zhouyi_print_reg_info(partition->reg, buf, len + ret, "CMD pool config",
 				     CMD_POOL_CONFIG_REG(0));
-	strcat(buf, tmp);
-	ret += zhouyi_print_reg_info(partition->reg, tmp, "CMD pool status",
+	ret += zhouyi_print_reg_info(partition->reg, buf, len + ret, "CMD pool status",
 				     CMD_POOL_STATUS_REG(0));
-	strcat(buf, tmp);
-	ret += zhouyi_print_reg_info(partition->reg, tmp, "CMD pool intr control",
+	ret += zhouyi_print_reg_info(partition->reg, buf, len + ret, "CMD pool intr control",
 				     CMD_POOL_INTR_CTRL_REG(0));
-	strcat(buf, tmp);
-	ret += zhouyi_print_reg_info(partition->reg, tmp, "CMD pool intr status",
+	ret += zhouyi_print_reg_info(partition->reg, buf, len + ret, "CMD pool intr status",
 				     CMD_POOL_INTR_STATUS_REG(0));
-	strcat(buf, tmp);
-	ret += zhouyi_print_reg_info(partition->reg, tmp, "CMD pool signal",
+	ret += zhouyi_print_reg_info(partition->reg, buf, len + ret, "CMD pool signal",
 				     CMD_POOL_IRQ_SIG_REG(0));
-	strcat(buf, tmp);
-	ret += zhouyi_print_reg_info(partition->reg, tmp, "CMD pool signal flag",
+	ret += zhouyi_print_reg_info(partition->reg, buf, len + ret, "CMD pool signal flag",
 				     CMD_POOL_IRQ_SIGNAL_FLAG_REG(0));
-	strcat(buf, tmp);
-	ret += zhouyi_print_reg_info(partition->reg, tmp, "CMD pool TCBP",
+	ret += zhouyi_print_reg_info(partition->reg, buf, len + ret, "CMD pool TCBP",
 				     CMD_POOL_INTR_TCB_PTR_REG(0));
-	strcat(buf, tmp);
-	ret += zhouyi_print_reg_info(partition->reg, tmp, "Debug page selection",
+	ret += zhouyi_print_reg_info(partition->reg, buf, len + ret, "Debug page selection",
 				     DEBUG_PAGE_SELECTION_REG);
-	strcat(buf, tmp);
 
 	return ret;
 }

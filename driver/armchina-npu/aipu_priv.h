@@ -8,6 +8,7 @@
 #include <linux/fs.h>
 #include <linux/miscdevice.h>
 #include <linux/types.h>
+#include <linux/workqueue.h>
 #include "armchina_aipu_soc.h"
 #include "aipu_irq.h"
 #include "aipu_io.h"
@@ -41,8 +42,6 @@ struct aipu_priv_operations {
  * @reg:           AIPU register base (v3 only)
  * @irq_obj:       interrupt object (v3 only)
  * @dev:           device struct pointer (of core 0 for v1/v2)
- * @soc:           SoC private data
- * @soc_ops:       SoC operation pointer
  * @aipu_fops:     file operation struct
  * @misc:          misc driver struct
  * @job_manager:   job manager struct
@@ -62,8 +61,6 @@ struct aipu_priv {
 	struct io_region reg;
 	struct aipu_irq_object *irq_obj;
 	struct device *dev;
-	struct aipu_soc              *soc;
-	struct aipu_soc_operations   *soc_ops;
 	const struct file_operations *aipu_fops;
 	struct miscdevice            misc;
 	struct aipu_job_manager      job_manager;
@@ -72,12 +69,27 @@ struct aipu_priv {
 	int reset_delay_us;
 	int core_reset_delay_us;
 	bool is_init;
-	struct io_region dbg_reg;
+	/*
+	 * printf signals deferred from the IRQ upper half to the
+	 * bottom half; owned by the job manager, kept here (appended
+	 * at the tail) because aipu_job_manager is embedded above and growing
+	 * it would shift every member after it.
+	 */
+	spinlock_t printf_lock; /* Protect the deferred printf signal ring */
+	struct aipu_printf_sig printf_sigs[AIPU_PRINTF_SIG_MAX];
+	u32 printf_head;
+	u32 printf_cnt;
+	u32 printf_dropped;
+	/*
+	 * the Job Deadline sweep; owned by the job
+	 * manager, kept at the tail for the same reason as the printf ring
+	 * above.
+	 */
+	struct delayed_work job_deadline_work;
 };
 
 int init_aipu_priv(struct aipu_priv *aipu, struct platform_device *p_dev,
-		   const struct file_operations *fops, struct aipu_soc *soc,
-		   struct aipu_soc_operations *soc_ops);
+		   const struct file_operations *fops);
 int deinit_aipu_priv(struct aipu_priv *aipu);
 int aipu_priv_get_version(struct aipu_priv *aipu);
 int aipu_priv_get_partition_cnt(struct aipu_priv *aipu);
@@ -85,7 +97,5 @@ int aipu_priv_query_partition_capability(struct aipu_priv *aipu, struct aipu_par
 int aipu_priv_query_capability(struct aipu_priv *aipu, struct aipu_cap *cap);
 int aipu_priv_io_rw(struct aipu_priv *aipu, struct aipu_io_req *io_req);
 int aipu_priv_check_status(struct aipu_priv *aipu);
-struct aipu_soc *get_soc(struct aipu_partition *partition);
-struct aipu_soc_operations *get_soc_ops(struct aipu_partition *partition);
 struct aipu_job_manager *get_job_manager(struct aipu_partition *partition);
 #endif /* __AIPU_PRIV_H__ */

@@ -15,13 +15,13 @@
  */
 struct io_region {
 	u64  phys;
-	void *kern;
-	u32  size;
+	void __iomem *kern;
+	u64  size;
 };
 
 int init_aipu_ioregion(struct io_region *region, u64 phys_base, u32 size);
 void deinit_aipu_ioregion(struct io_region *region);
-int aipu_read32(struct io_region *region, int offset);
-void aipu_write32(struct io_region *region, int offset, unsigned int data);
+int aipu_read32(struct io_region *region, int offset, u32 *val);
+int aipu_write32(struct io_region *region, int offset, unsigned int data);
 
 #endif /* __AIPU_IO_H__ */

@@ -30,15 +30,7 @@ struct aipu_scmi_perf_domain {
 	u32 domain_id;
 };
 
-int CIX_NPU_PD_NUM = CIX_NPU_PD_MAX_NUM;
-
-static const char *cix_npu_pd_names[CIX_NPU_PD_MAX_NUM] = {
-	"pd_core0", "pd_core1", "pd_core2",
-};
-
-static struct aipu_soc sky1 = {
-	.priv = NULL,
-};
+static int CIX_NPU_PD_NUM = CIX_NPU_PD_MAX_NUM;
 
 static struct cix_aipu_priv *cix_aipu_priv;
 
@@ -121,28 +113,18 @@ static struct cix_aipu_priv* sky1_priv_init(struct device *dev)
 	return cix_aipu_priv;
 }
 
-static void remove_debugfs_dir(const char *name)
-{
-    struct dentry *dentry;
-    struct dentry *parent = debugfs_lookup("opp", NULL);
-
-    if (IS_ERR_OR_NULL(parent)) {
-        pr_err("Failed to lookup opp debugfs directory\n");
-        return;
-    }
-
-    dentry = debugfs_lookup(name, parent);
-    if (IS_ERR_OR_NULL(dentry)) {
-        pr_err("Failed to lookup %s debugfs directory\n", name);
-        dput(parent);
-        return;
-    }
-
-    debugfs_remove_recursive(dentry);
-
-    dput(dentry);
-    dput(parent);
-}
+/*
+ * remove_debugfs_dir() deleted. It did
+ * debugfs_remove_recursive() on the SCMI perf domain's OPP directory, whose
+ * dentry the OPP core caches in an opp_table that outlives this module (it
+ * belongs to the persistent SCMI genpd device). The next probe's
+ * opp_debug_create_one() then called debugfs_create_dir() with a freed
+ * parent and panicked the kernel -- instruction abort at address 0 in
+ * start_dirop. The driver could be loaded only once per boot.
+ *
+ * It was dormant upstream only because the name was hardcoded to a DT path
+ * that never resolved on ACPI; 6.2.0 resolving the real name armed it.
+ */
 
 static int sky1_npu_devfreq_target(struct device *dev, unsigned long *freq, u32 flags)
 {
@@ -198,11 +180,7 @@ static int sky1_npu_devfreq_init(struct device *dev, struct cix_aipu_priv *cix_a
 
     profile = &(cix_aipu_priv->devfreq_profile);
 
-#ifdef CONFIG_ARM_SCMI_SUPPORT_DT_ACPI
-	cix_aipu_priv->opp_pmdomain = fwnode_dev_pm_domain_attach_by_name(dev, "perf");
-#else
-  	cix_aipu_priv->opp_pmdomain = dev_pm_domain_attach_by_name(dev, "perf");
-#endif
+	cix_aipu_priv->opp_pmdomain = dev_pm_domain_attach_by_name(dev, "perf");
 
     if (IS_ERR_OR_NULL(cix_aipu_priv->opp_pmdomain)) {
         dev_err(dev, "Failed to get perf domain");
@@ -231,6 +209,10 @@ static int sky1_npu_devfreq_init(struct device *dev, struct cix_aipu_priv *cix_a
         goto unlink_opp;
     }
     profile->freq_table = kmalloc_array(opp_count, sizeof(unsigned long), GFP_KERNEL);
+    if (!profile->freq_table) {
+        ret = -ENOMEM;
+        goto unlink_opp;
+    }
     for (i = 0, freq = 0; i < opp_count; i++, freq++) {
         opp = dev_pm_opp_find_freq_ceil(cix_aipu_priv->opp_pmdomain, &freq);
         if (IS_ERR(opp))
@@ -292,21 +274,23 @@ detach_opp:
 static int sky1_npu_devfreq_remove(struct device *dev, struct cix_aipu_priv *cix_aipu_priv)
 {
     int i = 0;
-    int opp_count;
     struct devfreq_dev_profile *profile;
-    const char *opp_pd_name;
 
     profile = &(cix_aipu_priv->devfreq_profile);
-    opp_count = dev_pm_opp_get_opp_count(cix_aipu_priv->opp_pmdomain);
 
     if (cix_aipu_priv->devfreq) {
         devm_devfreq_unregister_opp_notifier(dev, cix_aipu_priv->devfreq);
         devm_devfreq_remove_device(dev, cix_aipu_priv->devfreq);
-        devm_kfree(dev, cix_aipu_priv->devfreq->data);
         cix_aipu_priv->devfreq = NULL;
     }
 
-    for (i = 0; i < opp_count; i++) {
+    /*
+     * freq_table is kmalloc_array (not zeroed) and filled by a
+     * loop that may break early; max_state records how many entries are
+     * valid. The supplier's OPP count the old code re-queried can exceed
+     * that, passing uninitialised heap words to dev_pm_opp_remove.
+     */
+    for (i = 0; i < profile->max_state; i++) {
         if (profile->freq_table[i]) {
             dev_pm_opp_remove(dev, profile->freq_table[i]);
         }
@@ -322,13 +306,12 @@ static int sky1_npu_devfreq_remove(struct device *dev, struct cix_aipu_priv *cix
      * persistent (it lives in SCMI), so without this remove the next
      * probe sees every frequency added by SCMI as a duplicate and the
      * OPP core warns "_opp_is_duplicate: duplicate OPPs detected".
-     * Capture the dev_name before detaching, then remove the OPP table
-     * (which on most kernels also tears down the debugfs entry) before
-     * tearing down the device link to the supplier.
+     *
+     * This releases OUR dynamically-added OPPs, which is the
+     * whole of our responsibility here. The supplier's debugfs directory
+     * is the OPP core's to manage; the removal that used to follow this
+     * freed a dentry the OPP core still held and panicked the next probe.
      */
-    opp_pd_name = cix_aipu_priv->opp_pmdomain ?
-                  kstrdup(dev_name(cix_aipu_priv->opp_pmdomain), GFP_KERNEL) :
-                  NULL;
     if (cix_aipu_priv->opp_pmdomain)
         dev_pm_opp_remove_table(cix_aipu_priv->opp_pmdomain);
 
@@ -339,17 +322,6 @@ static int sky1_npu_devfreq_remove(struct device *dev, struct cix_aipu_priv *cix
     if (cix_aipu_priv->opp_pmdomain) {
         dev_pm_domain_detach(cix_aipu_priv->opp_pmdomain, true);
         cix_aipu_priv->opp_pmdomain = NULL;
-    }
-
-    /*
-     * Defensive: if the kernel did not auto-remove the supplier's OPP
-     * debugfs entry (older kernels can leak it), drop it by its real
-     * name. The previously-hardcoded "genpd:3:14260000.aipu" only
-     * matched DT and failed silently on ACPI ("Failed to lookup...").
-     */
-    if (opp_pd_name) {
-        remove_debugfs_dir(opp_pd_name);
-        kfree(opp_pd_name);
     }
 
     return 0;
@@ -385,56 +357,12 @@ int sky1_npu_pm_runtime_put(struct device *dev)
 #endif /* CONFIG_PM */
 }
 
-static int sky1_npu_attach_pd(struct device *dev, struct aipu_soc *soc)
-{
-	int i = 0;
-	int ret;
-	struct device_link *link;
-
-	for (i = 0; i < CIX_NPU_PD_NUM; i++) {
-		dev_dbg(dev, "%s\n", cix_npu_pd_names[i]);
-
-		cix_aipu_priv->pd_core[i] = dev_pm_domain_attach_by_name(dev, cix_npu_pd_names[i]);
-		if (IS_ERR(cix_aipu_priv->pd_core[i])) {
-			dev_err(dev, "failed to get pd %s\n", cix_npu_pd_names[i]);
-			ret = PTR_ERR(cix_aipu_priv->pd_core[i]);
-			cix_aipu_priv->pd_core[i] = NULL;
-			goto err_detach;
-		}
-
-		link = device_link_add(dev, cix_aipu_priv->pd_core[i],
-				DL_FLAG_STATELESS |
-				DL_FLAG_PM_RUNTIME |
-				DL_FLAG_RPM_ACTIVE);
-		if (!link) {
-			dev_err(dev, "Failed to add device_link to npu pd.\n");
-			dev_pm_domain_detach(cix_aipu_priv->pd_core[i], true);
-			cix_aipu_priv->pd_core[i] = NULL;
-			ret = -EINVAL;
-			goto err_detach;
-		}
-	}
-
-	return 0;
-
-err_detach:
-	/* Unwind the domains and links already attached for cores [0, i). */
-	while (i-- > 0) {
-		device_link_remove(dev, cix_aipu_priv->pd_core[i]);
-		dev_pm_domain_detach(cix_aipu_priv->pd_core[i], true);
-		cix_aipu_priv->pd_core[i] = NULL;
-	}
-
-	return ret;
-}
-
 /*
- * Reverse the per-core attach performed by sky1_npu_probe() (ACPI) and
- * sky1_npu_attach_pd() (DT). Safe to call after a partial attach: cores
- * left as NULL are skipped. Per-core runtime PM references taken via
- * pm_runtime_resume_and_get() are NOT dropped here -- on the normal
- * removal path runtime_suspend has already balanced them, and on the
- * probe error path the caller drops them before calling here.
+ * Reverse the per-core attach performed by sky1_npu_probe(). Safe to call
+ * after a partial attach: cores left as NULL are skipped. Per-core runtime
+ * PM references taken via pm_runtime_resume_and_get() are NOT dropped here
+ * -- on the normal removal path runtime_suspend has already balanced them,
+ * and on the probe error path the caller drops them before calling here.
  */
 static void sky1_npu_teardown_cores(struct device *dev)
 {
@@ -444,24 +372,17 @@ static void sky1_npu_teardown_cores(struct device *dev)
 		if (!cix_aipu_priv->pd_core[i])
 			continue;
 
-		if (has_acpi_companion(dev)) {
-			/* Detach the ACPI PM domain and power the core off. */
-			dev_pm_domain_detach(cix_aipu_priv->pd_core[i], true);
-			/* Balance probe's pm_runtime_enable(). */
-			pm_runtime_disable(cix_aipu_priv->pd_core[i]);
-			/* Balance probe's bus_find_device_by_fwnode(). */
-			put_device(cix_aipu_priv->pd_core[i]);
-		} else {
-			dev_dbg(dev, "%s\n", cix_npu_pd_names[i]);
-			/* Drop the stateless link before the domain it refers to. */
-			device_link_remove(dev, cix_aipu_priv->pd_core[i]);
-			dev_pm_domain_detach(cix_aipu_priv->pd_core[i], true);
-		}
+		/* Detach the ACPI PM domain and power the core off. */
+		dev_pm_domain_detach(cix_aipu_priv->pd_core[i], true);
+		/* Balance probe's pm_runtime_enable(). */
+		pm_runtime_disable(cix_aipu_priv->pd_core[i]);
+		/* Balance probe's bus_find_device_by_fwnode(). */
+		put_device(cix_aipu_priv->pd_core[i]);
 		cix_aipu_priv->pd_core[i] = NULL;
 	}
 }
 
-static int sky1_npu_detach_pd(struct device *dev, struct aipu_soc *soc)
+static int sky1_npu_detach_pd(struct device *dev)
 {
 	dev_dbg(dev, "%s\n", __func__);
 
@@ -478,16 +399,6 @@ static int sky1_npu_detach_pd(struct device *dev, struct aipu_soc *soc)
 	return 0;
 }
 
-static struct aipu_soc_operations sky1_ops = {
-	.start_bw_profiling = NULL,
-	.stop_bw_profiling = NULL,
-	.read_profiling_reg = NULL,
-	.enable_clk = NULL,
-	.disable_clk = NULL,
-	.is_clk_enabled = NULL,
-	.is_aipu_irq = NULL,
-};
-
 static int sky1_npu_probe(struct platform_device *p_dev)
 {
 	int ret;
@@ -496,6 +407,8 @@ static int sky1_npu_probe(struct platform_device *p_dev)
 	struct fwnode_handle *child;
 
 	ret = device_property_read_u32(&p_dev->dev, "core_mask", &mask);
+	/* un-latch: a previous probe may have left this at 1 */
+	CIX_NPU_PD_NUM = CIX_NPU_PD_MAX_NUM;
 	if (mask == 0x1)
 	{
 		CIX_NPU_PD_NUM = 1;
@@ -505,12 +418,11 @@ static int sky1_npu_probe(struct platform_device *p_dev)
 
 	dev_info(&p_dev->dev, "%s: NPU core num is %d\n", __func__, CIX_NPU_PD_NUM);
 
-	sky1_priv_init(&p_dev->dev);
+	if (IS_ERR(sky1_priv_init(&p_dev->dev)))
+		return -ENOMEM;
 
-	sky1.priv = cix_aipu_priv;
 	dev_set_drvdata(&p_dev->dev, cix_aipu_priv);
 
-    if (has_acpi_companion(&p_dev->dev)) {
 #ifdef	CONFIG_ACPI
 		p_dev->dev.power.ignore_children = true;
         fwnode_for_each_child_node(p_dev->dev.fwnode, child) {
@@ -524,6 +436,22 @@ static int sky1_npu_probe(struct platform_device *p_dev)
 					break;
 
 				cix_aipu_priv->pd_core[i] = bus_find_device_by_fwnode(&platform_bus_type, child);
+				if (!cix_aipu_priv->pd_core[i]) {
+					dev_err(&p_dev->dev, "no platform device for NPU core %s\n",
+						acpi_device_bid(to_acpi_device_node(child)));
+					fwnode_handle_put(child);
+					ret = -ENODEV;
+					goto err_teardown_cores;
+				}
+				if (!has_acpi_companion(cix_aipu_priv->pd_core[i])) {
+					dev_err(&p_dev->dev, "no ACPI companion for NPU core %s\n",
+						acpi_device_bid(to_acpi_device_node(child)));
+					put_device(cix_aipu_priv->pd_core[i]);
+					cix_aipu_priv->pd_core[i] = NULL;
+					fwnode_handle_put(child);
+					ret = -ENODEV;
+					goto err_teardown_cores;
+				}
                 pm_runtime_enable(cix_aipu_priv->pd_core[i]);
 				dev_pm_domain_attach(cix_aipu_priv->pd_core[i], true);
 				dev_pm_set_driver_flags(cix_aipu_priv->pd_core[i], DPM_FLAG_NO_DIRECT_COMPLETE);
@@ -532,19 +460,31 @@ static int sky1_npu_probe(struct platform_device *p_dev)
                 i++;
             }
         }
-#endif
-    } else {
-		ret = sky1_npu_attach_pd(&p_dev->dev, &sky1);
-		if (ret) {
-			dev_err(&p_dev->dev, "aipu attach pd failed, ret: %d\n", ret);
-			return ret;
+
+		/*
+		 * the walk can simply run out of CRE* children;
+		 * unfilled NULL slots would otherwise reach every runtime-PM
+		 * loop. Firmware-conditional, so checked, not trusted.
+		 */
+		if (i < CIX_NPU_PD_NUM) {
+			dev_err(&p_dev->dev, "found %d of %d NPU core devices\n",
+				i, CIX_NPU_PD_NUM);
+			ret = -ENODEV;
+			goto err_teardown_cores;
 		}
-    }
+#else
+	/*
+	 * the DT probe leg was deleted as dead weight;
+	 * the ACPI walk above is the only way the cores can be found.
+	 */
+	ret = -ENODEV;
+	goto err_teardown_cores;
+#endif
 
 	ret = sky1_npu_devfreq_init(&p_dev->dev, cix_aipu_priv);
 	if (ret) {
 		dev_err(&p_dev->dev, "aipu devfreq init failed, ret: %d\n", ret);
-		goto devfreq_init_failed;
+		goto err_teardown_cores;
 	}
 
 #ifdef CONFIG_PM
@@ -553,15 +493,13 @@ static int sky1_npu_probe(struct platform_device *p_dev)
     pm_runtime_enable(&p_dev->dev);
 #endif /* CONFIG_PM */
 
-    if (has_acpi_companion(&p_dev->dev)) {
-		for (i = 0; i < CIX_NPU_PD_NUM; i++) {
-			ret = pm_runtime_resume_and_get(cix_aipu_priv->pd_core[i]);
-			if (ret < 0)
-				goto err_core_get;
-		}
-    }
+	for (i = 0; i < CIX_NPU_PD_NUM; i++) {
+		ret = pm_runtime_resume_and_get(cix_aipu_priv->pd_core[i]);
+		if (ret < 0)
+			goto err_core_get;
+	}
 
-    ret = armchina_aipu_probe(p_dev, &sky1, &sky1_ops);
+    ret = armchina_aipu_probe(p_dev);
     if (ret) {
 		dev_err(&p_dev->dev, "aipu real probe failed, ret: %d\n", ret);
 		i = CIX_NPU_PD_NUM;
@@ -569,8 +507,6 @@ static int sky1_npu_probe(struct platform_device *p_dev)
 	}
 
 	sky1_core_cnt_update(p_dev);
-
-	dev_err(&p_dev->dev, "%s: armchina_aipu_probe done\n", __func__); //TODO dbg
 
 #ifdef CONFIG_PM
     sky1_npu_pm_runtime_put(&p_dev->dev);
@@ -585,10 +521,8 @@ err_core_get:
 	 * that succeeded (the failing call already dropped its own ref); on
 	 * the armchina_aipu_probe() failure path all cores succeeded.
 	 */
-	if (has_acpi_companion(&p_dev->dev)) {
-		while (i-- > 0)
-			pm_runtime_put_sync(cix_aipu_priv->pd_core[i]);
-	}
+	while (i-- > 0)
+		pm_runtime_put_sync(cix_aipu_priv->pd_core[i]);
 
 #ifdef CONFIG_PM
 	/* Undo the NPU device runtime PM setup done just above. */
@@ -598,8 +532,15 @@ err_core_get:
 
 	sky1_npu_devfreq_remove(&p_dev->dev, cix_aipu_priv);
 
-devfreq_init_failed:
+err_teardown_cores:
 	sky1_npu_teardown_cores(&p_dev->dev);
+
+	/*
+	 * the devm allocation dies with this failed probe; a
+	 * stale global would make a later early-return probe's remove
+	 * dereference freed memory.
+	 */
+	cix_aipu_priv = NULL;
 
 	return ret;
 }
@@ -607,15 +548,26 @@ devfreq_init_failed:
 static void sky1_npu_remove(struct platform_device *p_dev)
 {
 	dev_dbg(&p_dev->dev, "%s \n", __func__);
+
+	/*
+	 * a core_mask of 0x0/0x2 makes probe return 0 having
+	 * initialized nothing, so remove can run with no priv to tear down.
+	 */
+	if (!cix_aipu_priv)
+		return;
+
 	sky1_npu_devfreq_remove(&p_dev->dev, cix_aipu_priv);
 
 	armchina_aipu_remove(p_dev);
 
-	sky1_npu_detach_pd(&p_dev->dev, &sky1);
+	sky1_npu_detach_pd(&p_dev->dev);
 
 #ifdef CONFIG_PM
 	pm_runtime_disable(&p_dev->dev);
 #endif /* CONFIG_PM */
+
+	/* devm memory: it dies with this unbind */
+	cix_aipu_priv = NULL;
 }
 
 #ifdef CONFIG_PM
@@ -632,11 +584,8 @@ static int sky1_npu_runtime_suspend(struct device *dev)
 		return ret;
 	}
 
-	if (has_acpi_companion(dev)) {
-		for (int i = 0; i < CIX_NPU_PD_NUM; i++) {
-			pm_runtime_put(cix_aipu_priv->pd_core[i]);
-		}
-	}
+	for (int i = 0; i < CIX_NPU_PD_NUM; i++)
+		pm_runtime_put(cix_aipu_priv->pd_core[i]);
 
 	return ret;
 }
@@ -644,21 +593,34 @@ static int sky1_npu_runtime_suspend(struct device *dev)
 static int sky1_npu_runtime_resume(struct device *dev)
 {
 	int ret;
+	int i;
 	struct platform_device *p_dev = to_platform_device(dev);
 
-	if (has_acpi_companion(dev)) {
-		for (int i = 0; i < CIX_NPU_PD_NUM; i++) {
-			ret = pm_runtime_get_sync(cix_aipu_priv->pd_core[i]);
-			if (ret < 0) {
-				dev_err(cix_aipu_priv->pd_core[i], "NPU core PM runtime get sync failed! ret=%d", ret);
-				return ret;
-			}
+	for (i = 0; i < CIX_NPU_PD_NUM; i++) {
+		ret = pm_runtime_get_sync(cix_aipu_priv->pd_core[i]);
+		if (ret < 0) {
+			dev_err(cix_aipu_priv->pd_core[i], "NPU core PM runtime get sync failed! ret=%d", ret);
+			/*
+			 * get_sync increments even on
+			 * failure. Drop this core's reference and unwind
+			 * the cores already resumed, so a partial resume
+			 * does not strand some power domains on with no
+			 * path to reconcile them.
+			 */
+			pm_runtime_put_noidle(cix_aipu_priv->pd_core[i]);
+			while (i-- > 0)
+				pm_runtime_put(cix_aipu_priv->pd_core[i]);
+			return ret;
 		}
 	}
 
 	ret = armchina_aipu_resume(p_dev);
-	if (ret)
+	if (ret) {
+		/* resume failed after the cores came up: release them */
+		for (i = 0; i < CIX_NPU_PD_NUM; i++)
+			pm_runtime_put(cix_aipu_priv->pd_core[i]);
 		return ret;
+	}
 
 	sky1_core_cnt_update(p_dev);
 
@@ -666,8 +628,7 @@ static int sky1_npu_runtime_resume(struct device *dev)
 }
 
 static void npu_complete(struct device *dev) {
-	if (has_acpi_companion(dev))
-		pm_request_resume(dev);
+	pm_request_resume(dev);
 }
 
 static const struct dev_pm_ops cix_sky1_npu_pm_ops = {
@@ -676,26 +637,6 @@ static const struct dev_pm_ops cix_sky1_npu_pm_ops = {
 	.complete = npu_complete,
 };
 #endif /* CONFIG_PM */
-
-#ifdef CONFIG_OF
-static const struct of_device_id aipu_of_match[] = {
-	{
-		.compatible = "armchina,zhouyi-v1",
-	},
-	{
-		.compatible = "armchina,zhouyi-v2",
-	},
-	{
-		.compatible = "armchina,zhouyi-v3",
-	},
-	{
-		.compatible = "armchina,zhouyi",
-	},
-	{ }
-};
-
-MODULE_DEVICE_TABLE(of, aipu_of_match);
-#endif
 
 static const struct acpi_device_id aipu_acpi_match[] = {
 							{ .id = "CIXH4000", .driver_data = 0 },
@@ -712,10 +653,7 @@ static struct platform_driver aipu_platform_driver = {
 #ifdef CONFIG_PM
 		.pm = &cix_sky1_npu_pm_ops,
 #endif /* CONFIG_PM */
-#ifdef CONFIG_OF
-		.of_match_table = of_match_ptr(aipu_of_match),
 		.acpi_match_table = ACPI_PTR(aipu_acpi_match)
-#endif
 	},
 };
 

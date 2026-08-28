@@ -52,19 +52,25 @@ void deinit_aipu_ioregion(struct io_region *region)
  * @aipu_read32() - read AIPU register in word
  * @region: pointer to struct io_region initialized in init_aipu_ioregion()
  * @offset: AIPU register offset
- * Return: u32 value in the register or error code
+ * @val:    pointer receiving the value read back, written on success only
+ *
+ * Return: 0 on success and error code otherwise. The value travels through
+ * @val rather than the return so a register reading 0xFFFFFFEA is
+ * distinguishable from -EINVAL; the bound requires the whole word to fit
+ * (offset < size accepted reads up to 3 bytes past the mapping).
  */
-int aipu_read32(struct io_region *region, int offset)
+int aipu_read32(struct io_region *region, int offset, u32 *val)
 {
-	u32 val = 0;
+	if (!region || !region->kern || !val)
+		return -EINVAL;
 
-	if (region && region->kern && offset < region->size) {
-		val = readl((void __iomem *)((unsigned long)(region->kern) + offset));
-		pr_debug("[Read AIPU Register]: reg addr: 0x%llx + 0x%x, read back value: 0x%x\n",
-			 region->phys, offset, val);
-		return val;
-	}
-	return -EINVAL;
+	if (offset < 0 || (u64)offset + 4 > region->size)
+		return -EINVAL;
+
+	*val = readl((u8 __iomem *)region->kern + offset);
+	pr_debug("[Read AIPU Register]: reg addr: 0x%llx + 0x%x, read back value: 0x%x\n",
+		 region->phys, offset, *val);
+	return 0;
 }
 
 /**
@@ -72,11 +78,20 @@ int aipu_read32(struct io_region *region, int offset)
  * @region: pointer to struct io_region initialized in init_aipu_ioregion()
  * @offset: AIPU register offset
  * @data:   u32 data to be writen
+ *
+ * Return: 0 on success and error code otherwise. A rejected write is no
+ * longer logged as if it happened (upstream 4.3.0).
  */
-void aipu_write32(struct io_region *region, int offset, unsigned int data)
+int aipu_write32(struct io_region *region, int offset, unsigned int data)
 {
-	if (region && region->kern && offset < region->size)
-		writel((u32)data, (void __iomem *)((unsigned long)(region->kern) + offset));
+	if (!region || !region->kern)
+		return -EINVAL;
+
+	if (offset < 0 || (u64)offset + 4 > region->size)
+		return -EINVAL;
+
+	writel((u32)data, (u8 __iomem *)region->kern + offset);
 	pr_debug("[Write AIPU Register]: reg addr: 0x%llx + 0x%x, write value: 0x%x\n",
 		 region->phys, offset, (u32)data);
+	return 0;
 }

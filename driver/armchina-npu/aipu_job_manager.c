@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /* Copyright (c) 2023-2025 Arm Technology (China) Co. Ltd. */
 
+#include <linux/module.h>
 #include <linux/string.h>
 #include <linux/time.h>
 #include <linux/uaccess.h>
@@ -75,6 +76,26 @@ static void delete_wait_queue(struct aipu_thread_wait_queue **wait_queue_head)
 	}
 }
 
+/*
+ * a queue registered in a sleeping poller's poll table outlives
+ * the poll_wait() call: &wq->p_wait stays referenced until the poller leaves
+ * poll(). Freeing such a queue is a use-after-free on the poller's wakeup or
+ * poll-table teardown, so a queue is only freeable when its p_wait
+ * has no waiters — checked under p_wait's own lock so a mid-removal
+ * remove_wait_queue() cannot be caught halfway.
+ */
+static bool wait_queue_in_use(struct aipu_thread_wait_queue *queue)
+{
+	unsigned long flags;
+	bool in_use = false;
+
+	spin_lock_irqsave(&queue->p_wait.lock, flags);
+	in_use = !list_empty(&queue->p_wait.head);
+	spin_unlock_irqrestore(&queue->p_wait.lock, flags);
+
+	return in_use;
+}
+
 static void delete_thread_wait_queue(struct aipu_thread_wait_queue *head,
 				     int uthread_id, struct file *filp)
 {
@@ -84,7 +105,21 @@ static void delete_thread_wait_queue(struct aipu_thread_wait_queue *head,
 	if (unlikely(!head))
 		return;
 	list_for_each_entry_safe(curr, next, &head->node, node) {
-		if (curr && !curr->ref_cnt) {
+		/*
+		 * this swept away every zero-ref queue and
+		 * ignored both scoping arguments, so any fd's release freed
+		 * other processes' queues. Honour them now, keyed
+		 * the same way the queues are created and looked up: by fd
+		 * for enable_poll_opt queues (uthread_id 0, filp set), by
+		 * thread otherwise (filp NULL, uthread_id set). A queue
+		 * another fd's poll table still references is never freed
+		 * here; it falls to a later close or to delete_wait_queue()
+		 * at teardown.
+		 */
+		if (!curr->ref_cnt &&
+		    ((curr->uthread_id == uthread_id && uthread_id) ||
+		     (curr->filp == filp && filp)) &&
+		    !wait_queue_in_use(curr)) {
 			list_del(&curr->node);
 			kfree(curr);
 		}
@@ -240,6 +275,19 @@ static bool is_user_job_valid(struct aipu_job_manager *manager, struct aipu_job_
 			return false;
 		}
 
+		/*
+		 * enable_prof is documented v1/v2-only, and the
+		 * V3 completion path would call sky1's all-NULL soc_ops
+		 * vtable through it, in hard-IRQ context. Refuse the
+		 * input the hardware cannot service, like the version and
+		 * partition checks above.
+		 */
+		if (user_job->enable_prof) {
+			dev_err(manager->dev,
+				"invalid job: enable_prof is not supported on v3");
+			return false;
+		}
+
 		if (user_job->exec_flag & AIPU_JOB_EXEC_FLAG_DBG_DISPATCH) {
 			partition = &manager->partitions[partition_id];
 			core_cnt = atomic_read(&partition->clusters[0].en_core_cnt);
@@ -307,10 +355,11 @@ static void reserve_core_for_job_no_lock(struct aipu_job_manager *manager, struc
 
 	sched_core = &manager->partitions[job->core_id];
 	manager->idle_bmap[job->core_id] = 0;
-	if (job->desc.enable_prof) {
-		get_soc_ops(sched_core)->start_bw_profiling(sched_core->dev, get_soc(sched_core));
-		job->sched_time = ktime_get();
-	}
+	/*
+	 * stamped unconditionally: the Job Deadline needs a
+	 * dispatch time on every job, not only profiled ones.
+	 */
+	job->sched_time = ktime_get();
 
 	ret = sched_core->ops->reserve(sched_core, &job->desc, do_trigger, 0);
 	if (do_trigger && !ret)
@@ -335,6 +384,17 @@ static void check_enable_tec_interrupts(struct aipu_job_manager *manager, struct
 	htbuf = aipu_mm_get_hold_htbuf(manager->mm, job->curr_hold_tcb);
 	if (!htbuf) {
 		dev_err(manager->dev, "get hold tbuf failed: 0x%llx\n", job->curr_hold_tcb);
+		return;
+	}
+
+	/*
+	 * A hold buffer that never completed its alloc (or is racing a
+	 * teardown) carries NULL prev_tbuf / tail_tcb: the same fields
+	 * aipu_mm_unlink_tcb() was hardened against after a shipped Oops.
+	 */
+	if (!htbuf->prev_tbuf || !htbuf->prev_tbuf->tail_tcb) {
+		dev_err(manager->dev, "hold tbuf 0x%llx has no prev tail tcb\n",
+			job->curr_hold_tcb);
 		return;
 	}
 
@@ -414,23 +474,6 @@ static int schedule_v3_job_no_lock(struct aipu_job_manager *manager, struct aipu
 		htbuf->prev_hold_tcb = qlist->curr_tail;
 	}
 
-	/*
-	 * DEBUG (V3_IOVA_DEBUG): dump the chain we are about to dispatch.
-	 * link_from is the previous job's hold-TCB tail that this job is linked
-	 * onto; *_m flags report whether that address is still IOMMU-mapped.
-	 * link_m=0 (or htsk_m=0) means the command pool is about to walk a TCB
-	 * whose backing buffer was already freed -> stale-TCB re-walk.
-	 */
-	v3dbg(manager->mm,
-	      "DISPATCH    job=0x%llx trig=%d head=0x%llx ftsk=0x%llx ltsk=0x%llx hold=0x%llx prev_hold=0x%llx link_from=0x%llx pool_head=0x%llx | head_m=%d ltsk_m=%d link_m=%d\n",
-	      job->desc.job_id, trigger_type, job->desc.head_tcb_pa,
-	      job->desc.first_task_tcb_pa, job->desc.last_task_tcb_pa,
-	      htbuf->head, htbuf->prev_hold_tcb, qlist->curr_tail,
-	      qlist->pool_head,
-	      !!aipu_mm_v3_dbg_iova_phys(manager->mm, job->desc.head_tcb_pa),
-	      !!aipu_mm_v3_dbg_iova_phys(manager->mm, job->desc.last_task_tcb_pa),
-	      !!aipu_mm_v3_dbg_iova_phys(manager->mm, qlist->curr_tail));
-
 	qlist->curr_head = job->desc.head_tcb_pa;
 	qlist->curr_tail = htbuf->head;
 	qlist->tail_tcb  = htbuf->hold_tcb;
@@ -454,6 +497,93 @@ static int schedule_v3_job_no_lock(struct aipu_job_manager *manager, struct aipu
 	return ret;
 }
 
+/*
+ * the Job Deadline: the driver-side give-up threshold
+ * for a submitted job. A job that has neither completed nor faulted within it
+ * is expired -- reported to userspace as an exception and retired exactly as
+ * the completion path retires a finished one -- never recovered (no driver action
+ * was found that clears a true wedge, so an expiry
+ * action that "recovered" would act on an assumed mechanism). 30 s is 20x the
+ * longest measured inference and 3x the stock UMD's own ~10 s give-up, so a
+ * healthy system never sees it; 0 disables and restores stock semantics
+ * exactly (no sweep is ever armed).
+ */
+static uint job_deadline_s = 30;
+module_param(job_deadline_s, uint, 0644);
+MODULE_PARM_DESC(job_deadline_s,
+		 "seconds a job may stay running/deferred before it is expired and reported as an exception (default 30, 0 disables)");
+
+#define AIPU_JOB_DEADLINE_SWEEP_MS 5000
+
+/*
+ * Periodic self-rescheduling sweep, armed at dispatch, lapsing when no job is
+ * left running/deferred. No per-job timer: coarse expiry (deadline + period)
+ * is meaningless slack against a give-up threshold, and the measured hot
+ * paths gain nothing but the dispatch stamp.
+ *
+ * DEFERRED is expired too: a job parked behind a wedged pool is equally a
+ * zombie, and the suspend guard counts both.
+ */
+static void aipu_job_manager_deadline_sweep(struct work_struct *work)
+{
+	struct aipu_priv *aipu = container_of(work, struct aipu_priv, job_deadline_work.work);
+	struct aipu_job_manager *manager = &aipu->job_manager;
+	struct aipu_job *curr = NULL;
+	u32 deadline_s = READ_ONCE(job_deadline_s);
+	ktime_t now = ktime_get();
+	bool outstanding = false;
+	bool expired = false;
+	unsigned long flags;
+	int id = 0;
+
+	spin_lock_irqsave(&manager->lock, flags);
+	list_for_each_entry(curr, &manager->scheduled_head->node, node) {
+		if (curr->state != AIPU_JOB_STATE_RUNNING &&
+		    curr->state != AIPU_JOB_STATE_DEFERRED)
+			continue;
+
+		if (deadline_s && ktime_to_ns(curr->sched_time) &&
+		    ktime_ms_delta(now, curr->sched_time) >= (s64)deadline_s * MSEC_PER_SEC) {
+			/*
+			 * This warning is the driver's entire wedge-detection
+			 * contribution: work was accepted and no
+			 * completion interrupt retired it within the deadline.
+			 */
+			dev_warn(manager->dev,
+				 "job 0x%llx (thread %d, %s) got no completion interrupt within the %u s job deadline; reporting it as an exception (possible NPU wedge)\n",
+				 curr->desc.job_id, curr->uthread_id,
+				 curr->state == AIPU_JOB_STATE_RUNNING ? "running" : "deferred",
+				 deadline_s);
+			curr->state = AIPU_JOB_STATE_EXCEP;
+			expired = true;
+			continue;
+		}
+
+		outstanding = true;
+	}
+	spin_unlock_irqrestore(&manager->lock, flags);
+
+	/* retire like the completion path: EXCEP -> bottom half -> wake-up */
+	if (expired && manager->partitions) {
+		for (id = 0; id < manager->partition_cnt; id++)
+			aipu_job_manager_irq_bottom_half(&manager->partitions[id]);
+	}
+
+	if (outstanding && deadline_s)
+		schedule_delayed_work(&aipu->job_deadline_work,
+				      msecs_to_jiffies(AIPU_JOB_DEADLINE_SWEEP_MS));
+}
+
+/* a no-op while the sweep is already pending (schedule_delayed_work) */
+static void aipu_job_manager_arm_deadline(struct aipu_job_manager *manager)
+{
+	struct aipu_priv *aipu = (struct aipu_priv *)manager->priv;
+
+	if (READ_ONCE(job_deadline_s))
+		schedule_delayed_work(&aipu->job_deadline_work,
+				      msecs_to_jiffies(AIPU_JOB_DEADLINE_SWEEP_MS));
+}
+
 static int schedule_new_job(struct aipu_job_manager *manager, struct aipu_job_desc *user_job,
 			    struct file *filp, int do_trigger)
 {
@@ -461,9 +591,6 @@ static int schedule_new_job(struct aipu_job_manager *manager, struct aipu_job_de
 	struct aipu_job *kern_job = NULL;
 	struct aipu_thread_wait_queue *queue = NULL;
 	unsigned long flags;
-	u64 dbg_head_pa = 0;	/* DEBUG: V3 dispatched init/grid TCB pa */
-	u64 dbg_ftsk_pa = 0;	/* DEBUG: V3 dispatched first task TCB pa */
-	u64 dbg_ltsk_pa = 0;	/* DEBUG: V3 dispatched last task TCB pa */
 
 	mutex_lock(&manager->wq_lock);
 	if (user_job->enable_poll_opt)
@@ -472,7 +599,15 @@ static int schedule_new_job(struct aipu_job_manager *manager, struct aipu_job_de
 		queue = create_thread_wait_queue(manager->wait_queue_head,
 						 task_pid_nr(current), NULL);
 
-	WARN_ON(IS_ERR(queue));
+	/*
+	 * an ERR_PTR queue passes init_aipu_job's `if (queue)`
+	 * and gets written through (queue->ref_cnt++) — a wild write the old
+	 * WARN_ON here only narrated.
+	 */
+	if (IS_ERR(queue)) {
+		mutex_unlock(&manager->wq_lock);
+		return PTR_ERR(queue);
+	}
 
 	kern_job = create_aipu_job(manager, user_job, queue, filp);
 	if (IS_ERR(kern_job)) {
@@ -485,24 +620,37 @@ static int schedule_new_job(struct aipu_job_manager *manager, struct aipu_job_de
 		ret = aipu_mm_hold_tcb_buf_alloc(manager->mm, kern_job);
 		if (ret != 0) {
 			dev_err(manager->dev, "malloc placeholder tcb failed.\n");
+			/*
+			 * The job is not yet on scheduled_head: nothing else
+			 * can find it, so drop its wait-queue reference and
+			 * free it here or it leaks (and pins the queue) forever.
+			 */
+			mutex_lock(&manager->wq_lock);
+			if (kern_job->thread_queue)
+				delete_wait_node(&manager->wait_queue_head,
+						 kern_job->thread_queue);
+			destroy_aipu_job(manager, kern_job);
+			mutex_unlock(&manager->wq_lock);
 			return -ENOMEM;
 		}
 	}
 
 	spin_lock_irqsave(&manager->lock, flags);
+	/*
+	 * every branch below leaves the job RUNNING, DEFERRED or
+	 * PENDING, so it needs the dispatch stamp the Job Deadline measures
+	 * from; the pre-v3 reserve path re-stamps at its own trigger.
+	 */
+	kern_job->sched_time = ktime_get();
 	if (do_trigger) {
 		kern_job->state = AIPU_JOB_STATE_PENDING;
 
 		if (user_job->aipu_version == AIPU_ISA_VERSION_ZHOUYI_V3) {
 			list_add_tail(&kern_job->node, &manager->scheduled_head->node);
 			ret = schedule_v3_job_no_lock(manager, kern_job);
-			if (!ret) {
+			if (!ret)
 				kern_job->state = AIPU_JOB_STATE_RUNNING;
-				/* capture pa's for the post-unlock TCB dump */
-				dbg_head_pa = kern_job->desc.head_tcb_pa;
-				dbg_ftsk_pa = kern_job->desc.first_task_tcb_pa;
-				dbg_ltsk_pa = kern_job->desc.last_task_tcb_pa;
-			} else
+			else
 				kern_job->state = AIPU_JOB_STATE_DEFERRED;
 		} else {
 			/*
@@ -544,35 +692,8 @@ static int schedule_new_job(struct aipu_job_manager *manager, struct aipu_job_de
 unlock:
 	spin_unlock_irqrestore(&manager->lock, flags);
 
-	/*
-	 * DEBUG: dump the dispatched V3 job's init/grid TCB (asids[4]) and first
-	 * task TCB (data pointers + per-field mapped flag) in process context so
-	 * the mutex-taking IOVA->VA walk is legal.  A pointer field printed with
-	 * m0 (unmapped) is the stale/dangling address the NPU faults on.  We use
-	 * the pa's captured under the lock, not kern_job, to avoid touching a job
-	 * that may retire concurrently; reading the TCB body is a benign debug
-	 * race acceptable for this instrumentation.
-	 */
-	if (dbg_head_pa)
-		aipu_mm_v3_dbg_dump_tcb(manager->mm, dbg_head_pa, "head");
-	if (dbg_ftsk_pa)
-		aipu_mm_v3_dbg_dump_tcb(manager->mm, dbg_ftsk_pa, "ftsk");
-	/* walk the full chain to pin the exact dangling pointer field */
-	if (dbg_head_pa)
-		aipu_mm_v3_dbg_dump_tcb_chain(manager->mm, dbg_head_pa,
-					      dbg_ltsk_pa, "job");
-	/*
-	 * Dump the init/seg-mmu head TCB raw so a seg-mmu/GM/DTCM base shows up
-	 * directly, then sweep every buffer for a dangling full pointer (a high
-	 * IOVA that is currently unmapped). This is page-agnostic: the faulting
-	 * IOVA moves between sessions, so we detect "unmapped" rather than match
-	 * a fixed page.
-	 */
-	if (dbg_head_pa) {
-		aipu_mm_v3_dbg_dump_tcb_raw(manager->mm, dbg_head_pa, 32, "head");
-		aipu_mm_v3_dbg_dump_tcb_raw(manager->mm, dbg_ftsk_pa, 32, "ftsk");
-		aipu_mm_v3_dbg_scan_all_for(manager->mm, 0, "job");
-	}
+	/* a job just went outstanding: keep watch */
+	aipu_job_manager_arm_deadline(manager);
 
 	return ret;
 }
@@ -591,6 +712,8 @@ static int trigger_deferred_job_run(struct aipu_job_manager *manager,
 		    curr->desc.job_id == user_job->job_id &&
 		    curr->state == AIPU_JOB_STATE_DEFERRED) {
 			curr->state = AIPU_JOB_STATE_RUNNING;
+			/* the deadline runs from the real trigger */
+			curr->sched_time = ktime_get();
 			if (user_job->aipu_version == AIPU_ISA_VERSION_ZHOUYI_V3) {
 				/**
 				 * for debugger: it should ensure that the NPUs are free to accept
@@ -612,6 +735,12 @@ static int trigger_deferred_job_run(struct aipu_job_manager *manager,
 			user_job->job_id);
 		return -EINVAL;
 	}
+
+	/*
+	 * normally armed since the deferred schedule; re-arm here
+	 * so a deadline enabled between defer and trigger still takes.
+	 */
+	aipu_job_manager_arm_deadline(manager);
 
 	return 0;
 }
@@ -644,27 +773,57 @@ int init_aipu_job_manager(struct aipu_job_manager *manager, struct aipu_memory_m
 		kmem_cache_create("aipu_job_cache", sizeof(struct aipu_job), 0, SLAB_PANIC, NULL);
 	manager->prof_cache = NULL;
 	mutex_init(&manager->wq_lock);
+	/*
+	 * both list heads used to be created unchecked — the
+	 * INIT_LIST_HEAD below dereferenced a possible ERR_PTR before the
+	 * old WARN_ONs even ran, and the function returned 0 regardless, so
+	 * probe marked the driver is_init around error-pointer list heads.
+	 */
 	manager->scheduled_head = create_aipu_job(manager, NULL, NULL, NULL);
+	if (IS_ERR(manager->scheduled_head)) {
+		ret = PTR_ERR(manager->scheduled_head);
+		manager->scheduled_head = NULL;
+		goto err_destroy_cache;
+	}
 	INIT_LIST_HEAD(&manager->scheduled_head->node);
 	spin_lock_init(&manager->lock);
 	manager->wait_queue_head = create_thread_wait_queue(NULL, 0, NULL);
+	if (IS_ERR(manager->wait_queue_head)) {
+		ret = PTR_ERR(manager->wait_queue_head);
+		manager->wait_queue_head = NULL;
+		goto err_destroy_scheduled_head;
+	}
 	mutex_init(&manager->id_lock);
 	manager->exec_flag = 0;
 	manager->mm = mm;
 	manager->priv = priv;
+	/* the deferred printf ring lives in aipu_priv */
+	spin_lock_init(&((struct aipu_priv *)priv)->printf_lock);
+	((struct aipu_priv *)priv)->printf_head = 0;
+	((struct aipu_priv *)priv)->printf_cnt = 0;
+	((struct aipu_priv *)priv)->printf_dropped = 0;
+	/* the Job Deadline sweep also lives in aipu_priv */
+	INIT_DELAYED_WORK(&((struct aipu_priv *)priv)->job_deadline_work,
+			  aipu_job_manager_deadline_sweep);
 	aipu_mm_get_asid(mm, &cap);
 	manager->asid0_base = aipu_mm_get_asid_base(mm, AIPU_BUF_ASID_0);
 	atomic_set(&manager->tick_counter, 0);
 	atomic_set(&manager->is_suspend, 0);
-
-	WARN_ON(IS_ERR(manager->scheduled_head));
-	WARN_ON(IS_ERR(manager->wait_queue_head));
 
 	memset(&manager->exit_tcb_desc, 0, sizeof(manager->exit_tcb_desc));
 
 	manager->exec_id = AIPU_EXEC_ID;
 
 	manager->is_init = 1;
+	return ret;
+
+err_destroy_scheduled_head:
+	destroy_aipu_job(manager, manager->scheduled_head);
+	manager->scheduled_head = NULL;
+err_destroy_cache:
+	kmem_cache_destroy(manager->job_cache);
+	manager->job_cache = NULL;
+	mutex_destroy(&manager->wq_lock);
 	return ret;
 }
 
@@ -677,6 +836,11 @@ void deinit_aipu_job_manager(struct aipu_job_manager *manager)
 	if (!manager || !manager->is_init)
 		return;
 
+	/*
+	 * the sweep walks scheduled_head and partitions: stop it
+	 * (and any self-reschedule) before they are torn down below.
+	 */
+	cancel_delayed_work_sync(&((struct aipu_priv *)manager->priv)->job_deadline_work);
 	kfree(manager->idle_bmap);
 	manager->idle_bmap = NULL;
 	delete_job_queue(manager, &manager->scheduled_head);
@@ -684,6 +848,12 @@ void deinit_aipu_job_manager(struct aipu_job_manager *manager)
 	mutex_destroy(&manager->wq_lock);
 	kmem_cache_destroy(manager->job_cache);
 	manager->job_cache = NULL;
+	/*
+	 * both are devm memory released with the unbind; a stale
+	 * manager must fault loudly on NULL rather than silently walk them.
+	 */
+	manager->partitions = NULL;
+	manager->pools = NULL;
 	manager->is_init = 0;
 }
 
@@ -692,20 +862,41 @@ void deinit_aipu_job_manager(struct aipu_job_manager *manager)
  * @manager:  pointer to the struct job_manager initialized in init_aipu_job_manager()
  * @partition_cnt: AIPU core count
  * @partitions:    pointer to AIPU core struct array
+ *
+ * Return: 0 on success and error code otherwise.
  */
-void aipu_job_manager_set_partitions_info(struct aipu_job_manager *manager, int partition_cnt,
-					  struct aipu_partition *partitions)
+int aipu_job_manager_set_partitions_info(struct aipu_job_manager *manager, int partition_cnt,
+					 struct aipu_partition *partitions)
 {
-	WARN_ON(!manager || !partition_cnt || !partitions);
+	if (!manager || !partition_cnt || !partitions)
+		return -EINVAL;
+
 	manager->partition_cnt = partition_cnt;
 	manager->partitions = partitions;
 	if (manager->version >= AIPU_ISA_VERSION_ZHOUYI_V3) {
 		manager->pools = devm_kzalloc(partitions[0].dev,
 					      partition_cnt * sizeof(*manager->pools),
 					      GFP_KERNEL);
+		if (!manager->pools)
+			goto err;
 	}
 	manager->idle_bmap = kmalloc_array(partition_cnt, sizeof(bool), GFP_KERNEL);
+	if (!manager->idle_bmap)
+		goto err;
 	memset(manager->idle_bmap, 1, partition_cnt);
+	return 0;
+
+err:
+	/*
+	 * leave no half-set state behind: the caller unwinds the
+	 * partitions array on failure, so a stale pointer here would be
+	 * walked again by the next re-bind. pools is devm memory; the
+	 * unbind frees it.
+	 */
+	manager->partition_cnt = 0;
+	manager->partitions = NULL;
+	manager->pools = NULL;
+	return -ENOMEM;
 }
 
 /**
@@ -734,6 +925,43 @@ int aipu_job_manager_scheduler(struct aipu_job_manager *manager, struct aipu_job
 		return -ENODEV;
 	}
 
+	/*
+	 * asid0_base is a [kmd] field: the completion path keys job matching on
+	 * (last_task_tcb_pa - asid0_base), so a caller-supplied asid0_base lets a
+	 * job match another process's completion IRQ and mark its running jobs
+	 * SUCCESS. Overwrite it with the manager's trusted base before the desc
+	 * is copied into the kernel job -- is_v3x_job_done_or_excep then matches
+	 * on a value the caller cannot forge.
+	 */
+	user_job->asid0_base = manager->asid0_base;
+
+	/*
+	 * The TCB addresses below are written straight into the TSM dispatch
+	 * registers (head/first_task) and drive completion matching
+	 * (last_task). Reject any non-zero address that does not resolve to a
+	 * buffer this fd owns, before it reaches the hardware -- this runs in
+	 * process context so the owning-buffer lookup (which takes buffer_mutex)
+	 * is safe here, unlike at the dispatch site under manager->lock.
+	 */
+	if (user_job->aipu_version == AIPU_ISA_VERSION_ZHOUYI_V3) {
+		u64 tcb_pa[] = {
+			user_job->head_tcb_pa,
+			user_job->first_task_tcb_pa,
+			user_job->last_task_tcb_pa,
+		};
+		int i;
+
+		for (i = 0; i < ARRAY_SIZE(tcb_pa); i++) {
+			if (tcb_pa[i] &&
+			    !aipu_mm_v3_pa_owned_by(manager->mm, tcb_pa[i], filp)) {
+				dev_err(manager->dev,
+					"[scheduler] job 0x%llx TCB address 0x%llx not owned by caller",
+					user_job->job_id, tcb_pa[i]);
+				return -EINVAL;
+			}
+		}
+	}
+
 	if (!user_job->is_defer_run)
 		ret = schedule_new_job(manager, user_job, filp, 1);
 	else if (!user_job->do_trigger)
@@ -748,19 +976,24 @@ int aipu_job_manager_scheduler(struct aipu_job_manager *manager, struct aipu_job
 	return ret;
 }
 
+/*
+ * runs in the bottom half only: the IOVA -> VA walks below take
+ * mm's buffer_mutex/phy_mutex, which used to sleep (and could deadlock)
+ * inside the hard-IRQ handler.
+ */
 static void aipu_job_manager_real_time_printk(struct aipu_job_manager *manager,
 					      struct aipu_partition *partition,
-					      struct job_irq_info *info)
+					      struct aipu_printf_sig *sig)
 {
 	struct aipu_tcb *tcb = NULL;
 	char *buf = NULL;
 
-	if (GET_PRINF_SIZE(info->sig_flag)) {
+	if (GET_PRINF_SIZE(sig->sig_flag)) {
 		/* here: tail TCBP is the exact TCB sending a printf signal */
-		tcb = aipu_mm_get_tcb(manager->mm, manager->asid0_base + info->tail_tcbp);
+		tcb = aipu_mm_get_tcb(manager->mm, manager->asid0_base + sig->tail_tcbp);
 		if (!tcb) {
 			dev_err(partition->dev, "real time printk: no TCB found (0x%x)\n",
-				info->tail_tcbp);
+				sig->tail_tcbp);
 			return;
 		}
 
@@ -772,6 +1005,56 @@ static void aipu_job_manager_real_time_printk(struct aipu_job_manager *manager,
 			dev_err(partition->dev, "real time printk: no pbuf found (0x%x)\n",
 				tcb->task.pprint);
 	}
+}
+
+/* hard-IRQ side: capture the two registers the bottom half needs, no locks
+ * beyond the ring's own spinlock, no allocation, no mm walk
+ */
+static void aipu_job_manager_defer_real_time_printk(struct aipu_job_manager *manager,
+						    struct job_irq_info *info)
+{
+	struct aipu_priv *aipu = (struct aipu_priv *)manager->priv;
+	u32 tail = 0;
+
+	spin_lock(&aipu->printf_lock);
+	if (aipu->printf_cnt < AIPU_PRINTF_SIG_MAX) {
+		tail = (aipu->printf_head + aipu->printf_cnt) % AIPU_PRINTF_SIG_MAX;
+		aipu->printf_sigs[tail].tail_tcbp = info->tail_tcbp;
+		aipu->printf_sigs[tail].sig_flag = info->sig_flag;
+		aipu->printf_cnt++;
+	} else {
+		aipu->printf_dropped++;
+	}
+	spin_unlock(&aipu->printf_lock);
+}
+
+static void aipu_job_manager_flush_printf_sigs(struct aipu_job_manager *manager,
+					       struct aipu_partition *partition)
+{
+	struct aipu_priv *aipu = (struct aipu_priv *)manager->priv;
+	struct aipu_printf_sig sig;
+	unsigned long flags;
+	u32 dropped = 0;
+
+	while (true) {
+		spin_lock_irqsave(&aipu->printf_lock, flags);
+		if (!aipu->printf_cnt) {
+			dropped = aipu->printf_dropped;
+			aipu->printf_dropped = 0;
+			spin_unlock_irqrestore(&aipu->printf_lock, flags);
+			break;
+		}
+		sig = aipu->printf_sigs[aipu->printf_head];
+		aipu->printf_head = (aipu->printf_head + 1) % AIPU_PRINTF_SIG_MAX;
+		aipu->printf_cnt--;
+		spin_unlock_irqrestore(&aipu->printf_lock, flags);
+
+		/* outside the ring lock: this path takes mm's mutexes */
+		aipu_job_manager_real_time_printk(manager, partition, &sig);
+	}
+
+	if (dropped)
+		dev_warn(partition->dev, "real time printk: %u signal(s) dropped\n", dropped);
 }
 
 static bool is_curr_irq_job(struct aipu_job *job, struct job_irq_info *info, u64 asid_base)
@@ -818,6 +1101,49 @@ static bool is_job_abnormal(struct aipu_job *job, int flag,
 	return flag != 0;
 }
 
+/*
+ * retire completed jobs -- profiling stamp, hold-TCB unlink,
+ * poller wake -- in the upper half, exactly as the bottom half would (its
+ * two loops skip anything retired here via !wake_up). The wake used to
+ * happen only in the bottom half, so every completion paid a hardirq ->
+ * normal-priority single-thread workqueue hand-off before poll() could
+ * return: 128-256 us on a 0.3 ms inference. The waiter-visible
+ * state (state, wake_up, pdata) is final before the wake, and the unlink
+ * must ride along with it: once woken, GET_JOB_STATUS can harvest and free
+ * the job record, and nothing else unlinks curr_hold_tcb -- the hold pool
+ * would shrink by one buffer every time the harvest beat the workqueue.
+ * Runs under manager->lock and nests mm->shlock inside it, exactly as the
+ * bottom half already does. The bottom half still owns every path that
+ * marks jobs outside this handler (pool abort, coredump signal, deadline
+ * expiry) and everything process-context (printf flush, pool destroy).
+ */
+static void retire_done_jobs_no_lock(struct aipu_job_manager *manager,
+				     struct aipu_partition *partition)
+{
+	struct aipu_job *curr = NULL;
+
+	list_for_each_entry(curr, &manager->scheduled_head->node, node) {
+		if (curr->state >= AIPU_JOB_STATE_EXCEP && !curr->wake_up &&
+		    (curr->desc.aipu_version >= AIPU_ISA_VERSION_ZHOUYI_V3 ||
+		     curr->core_id == partition->id)) {
+			if (curr->desc.enable_prof)
+				curr->pdata.execution_time_ns =
+				(long)ktime_to_ns(ktime_sub(curr->done_time, curr->sched_time));
+
+			if (curr->desc.aipu_version == AIPU_ISA_VERSION_ZHOUYI_V3 &&
+			    manager->mm && curr->curr_hold_tcb) {
+				if (aipu_mm_unlink_tcb(manager->mm, curr->curr_hold_tcb))
+					dev_warn_ratelimited(partition->dev,
+						"unlink_tcb failed (hold 0x%llx); MM may be torn down mid-job\n",
+						curr->curr_hold_tcb);
+			}
+
+			wake_up_interruptible(curr->thread_queue);
+			curr->wake_up = 1;
+		}
+	}
+}
+
 /**
  * @aipu_job_manager_irq_upper_half() - aipu interrupt upper half handler
  * @core:           pointer to the aipu core struct
@@ -841,7 +1167,7 @@ void aipu_job_manager_irq_upper_half(struct aipu_partition *partition, int flag,
 	if (manager->version == AIPU_ISA_VERSION_ZHOUYI_V3) {
 		if (IS_SIGNAL_IRQ(flag) && !IS_EXCEPTION_SIGNAL(info->sig_flag)) {
 			if (IS_PRINTF_SIGNAL(info->sig_flag))
-				aipu_job_manager_real_time_printk(manager, partition, info);
+				aipu_job_manager_defer_real_time_printk(manager, info);
 			if (IS_COREDUMP_SIGNAL(info->sig_flag)) {
 				spin_lock(&manager->lock);
 				list_for_each_entry(curr, &manager->scheduled_head->node, node) {
@@ -891,14 +1217,8 @@ void aipu_job_manager_irq_upper_half(struct aipu_partition *partition, int flag,
 			else
 				curr->state = AIPU_JOB_STATE_SUCCESS;
 
-			if (curr->desc.enable_prof) {
+			if (curr->desc.enable_prof)
 				curr->done_time = ktime_get();
-				get_soc_ops(partition)->stop_bw_profiling(partition->dev,
-									  get_soc(partition));
-				get_soc_ops(partition)->read_profiling_reg(partition->dev,
-									   get_soc(partition),
-									   &curr->pdata);
-			}
 
 			if (atomic_read(&manager->tick_counter) && info)
 				curr->pdata.tick_counter = info->tick_counter;
@@ -908,7 +1228,7 @@ void aipu_job_manager_irq_upper_half(struct aipu_partition *partition, int flag,
 			if (curr->desc.exec_flag & AIPU_JOB_EXEC_FLAG_SRAM_MUTEX)
 				manager->exec_flag &= ~AIPU_JOB_EXEC_FLAG_SRAM_MUTEX;
 
-			if (manager->pools && manager->pools->debug)
+			if (manager->pools && manager->pools[partition->id].debug)
 				manager->dbg_do_destroy = true;
 
 				/*
@@ -922,10 +1242,12 @@ void aipu_job_manager_irq_upper_half(struct aipu_partition *partition, int flag,
 				 * Assumptions:
 				 * - scheduled_head list order matches the hardware
 				 *   hold-TCB chain order (both follow schedule order).
-				 * - partition_id is sufficient to scope the chain;
-				 *   for V3 single-cluster there is one partition.
-				 *   Multi-partition deployments may need QoS-level
-				 *   filtering in the future.
+				 * - partition_id plus QoS class scope the chain: V3
+				 *   keeps two independent hardware chains per pool
+				 *   (qlist[SLOW]/qlist[FAST]) that progress and
+				 *   complete separately, so a completion on one chain
+				 *   must not retire preceding jobs on the other -- they
+				 *   may still be executing.
 				 * - Profiling data (done_time, tick_counter) is not
 				 *   collected for these preceding jobs. Jobs that
 				 *   require enable_prof should run without competing
@@ -938,7 +1260,9 @@ void aipu_job_manager_irq_upper_half(struct aipu_partition *partition, int flag,
 					if (prev == curr)
 						break;
 					if (prev->state == AIPU_JOB_STATE_RUNNING &&
-					    prev->desc.partition_id == curr->desc.partition_id) {
+					    prev->desc.partition_id == curr->desc.partition_id &&
+					    (prev->desc.exec_flag & AIPU_JOB_EXEC_FLAG_QOS_SLOW) ==
+					    (curr->desc.exec_flag & AIPU_JOB_EXEC_FLAG_QOS_SLOW)) {
 						prev->state = AIPU_JOB_STATE_SUCCESS;
 						if (prev->desc.exec_flag & AIPU_JOB_EXEC_FLAG_SRAM_MUTEX)
 							manager->exec_flag &= ~AIPU_JOB_EXEC_FLAG_SRAM_MUTEX;
@@ -971,21 +1295,28 @@ void aipu_job_manager_irq_upper_half(struct aipu_partition *partition, int flag,
 	if (!triggered)
 		manager->idle_bmap[partition->id] = 1;
 
+	retire_done_jobs_no_lock(manager, partition);
+
 	spin_unlock(&manager->lock);
 }
 
 static void aipu_job_manager_destroy_command_pool_no_lock(struct aipu_job_manager *manager,
-							  struct aipu_partition *partition,
-							  bool unlink)
+							  struct aipu_partition *partition)
 {
 	struct command_pool *pool;
 	int ret = 0;
 
-	if (!manager || !partition)
+	if (!manager || !partition || !manager->pools)
 		return;
 
-	pool = manager->pools;
-	if (pool && pool->created) {
+	/*
+	 * index the pool by the partition this was handed, like
+	 * every other pools[] site -- pools[0] was correct only by accident
+	 * on a single-partition part (the dead unlink parameter goes
+	 * with it).
+	 */
+	pool = &manager->pools[partition->id];
+	if (pool->created) {
 		if (manager->version == AIPU_ISA_VERSION_ZHOUYI_V3) {
 			ret = partition->ops->destroy_command_pool(partition, 0);
 			if (ret == 0) {
@@ -1016,6 +1347,9 @@ void aipu_job_manager_irq_bottom_half(struct aipu_partition *core)
 
 	manager = get_job_manager(core);
 
+	/* process context now: resolve and print the deferred printf signals */
+	aipu_job_manager_flush_printf_sigs(manager, core);
+
 	spin_lock_irqsave(&manager->lock, flags);
 
 	list_for_each_entry_safe(curr, next, &manager->scheduled_head->node, node) {
@@ -1028,22 +1362,7 @@ void aipu_job_manager_irq_bottom_half(struct aipu_partition *core)
 
 			if (curr->desc.aipu_version == AIPU_ISA_VERSION_ZHOUYI_V3 &&
 			    manager->mm && curr->curr_hold_tcb) {
-				/*
-				 * DEBUG (V3_IOVA_DEBUG): a job is being retired and
-				 * unlinked from the pool chain. ltsk_m flags whether
-				 * its last task TCB is still mapped at retire time;
-				 * compare timestamps against V3IOVA UNMAP/FREE_REQ to
-				 * see if buffers were freed before the job retired.
-				 */
-				v3dbg(manager->mm,
-				      "RETIRE      job=0x%llx state=%d head=0x%llx ltsk=0x%llx hold=0x%llx | ltsk_m=%d hold_m=%d\n",
-				      curr->desc.job_id, curr->state,
-				      curr->desc.head_tcb_pa,
-				      curr->desc.last_task_tcb_pa,
-				      curr->curr_hold_tcb,
-				      !!aipu_mm_v3_dbg_iova_phys(manager->mm, curr->desc.last_task_tcb_pa),
-				      !!aipu_mm_v3_dbg_iova_phys(manager->mm, curr->curr_hold_tcb));
-				if (aipu_mm_unlink_tcb(manager->mm, curr->curr_hold_tcb, false))
+				if (aipu_mm_unlink_tcb(manager->mm, curr->curr_hold_tcb))
 					dev_warn_ratelimited(core->dev,
 						"unlink_tcb failed (hold 0x%llx); MM may be torn down mid-job\n",
 						curr->curr_hold_tcb);
@@ -1056,8 +1375,8 @@ void aipu_job_manager_irq_bottom_half(struct aipu_partition *core)
 	}
 
 	if (manager->pools &&
-	    (!is_grid_end(manager->pools->qlist[AIPU_JOB_QOS_SLOW].tail_tcb) ||
-	     !is_grid_end(manager->pools->qlist[AIPU_JOB_QOS_FAST].tail_tcb)))
+	    (!is_grid_end(manager->pools[core->id].qlist[AIPU_JOB_QOS_SLOW].tail_tcb) ||
+	     !is_grid_end(manager->pools[core->id].qlist[AIPU_JOB_QOS_FAST].tail_tcb)))
 		do_destroy = false;
 
 	if (manager->dbg_do_destroy) {
@@ -1066,7 +1385,7 @@ void aipu_job_manager_irq_bottom_half(struct aipu_partition *core)
 	}
 
 	if (do_destroy)
-		aipu_job_manager_destroy_command_pool_no_lock(manager, core, true);
+		aipu_job_manager_destroy_command_pool_no_lock(manager, core);
 
 	list_for_each_entry_safe(curr, next, &manager->scheduled_head->node, node) {
 		if (curr->state >= AIPU_JOB_STATE_EXCEP && !curr->wake_up &&
@@ -1093,14 +1412,21 @@ int aipu_job_manager_abort_cmd_pool(struct aipu_job_manager *manager)
 	if (!manager)
 		return -EINVAL;
 
-	if (!manager->pools->created)
+	/*
+	 * pools is V3-only and was dereferenced here before the
+	 * NULL check four lines below it ever ran. (pools != NULL also
+	 * implies partitions was set up, so forming the pointer is safe.)
+	 */
+	if (!manager->pools)
 		return -ENODEV;
 
 	partition = &manager->partitions[0];
+	if (!manager->pools[partition->id].created)
+		return -ENODEV;
 
 	spin_lock_irqsave(&manager->lock, flags);
 	ret = partition->ops->abort_command_pool(partition, 0);
-	if (!ret && manager->pools)
+	if (!ret)
 		manager->pools[partition->id].aborted = true;
 
 	list_for_each_entry(curr, &manager->scheduled_head->node, node) {
@@ -1150,11 +1476,18 @@ int aipu_job_manager_cancel_jobs(struct aipu_job_manager *manager, struct file *
 	spin_lock_irqsave(&manager->lock, flags);
 	list_for_each_entry_safe(curr, next, &manager->scheduled_head->node, node) {
 		if (curr->filp == filp) {
-			par = &manager->partitions[curr->core_id];
-			if (curr->desc.aipu_version < AIPU_ISA_VERSION_ZHOUYI_V3 &&
-			    (curr->state == AIPU_JOB_STATE_DEFERRED ||
-			     (curr->state == AIPU_JOB_STATE_RUNNING && par->ops->is_idle(par))))
-				manager->idle_bmap[curr->core_id] = 1;
+			/*
+			 * core_id stays -1 on every V3 job (only
+			 * the pre-V3 branch assigns it), so form the
+			 * partition pointer only where it is used.
+			 */
+			if (curr->desc.aipu_version < AIPU_ISA_VERSION_ZHOUYI_V3) {
+				par = &manager->partitions[curr->core_id];
+				if (curr->state == AIPU_JOB_STATE_DEFERRED ||
+				    (curr->state == AIPU_JOB_STATE_RUNNING &&
+				     par->ops->is_idle(par)))
+					manager->idle_bmap[curr->core_id] = 1;
+			}
 
 			if ((manager->version >= AIPU_ISA_VERSION_ZHOUYI_V3) &&
 				curr->state == AIPU_JOB_STATE_RUNNING)
@@ -1170,14 +1503,23 @@ int aipu_job_manager_cancel_jobs(struct aipu_job_manager *manager, struct file *
 	if (!multi_process &&
 	    (manager->version >= AIPU_ISA_VERSION_ZHOUYI_V3)) {
 		aipu_job_manager_destroy_command_pool_no_lock(manager,
-							      &manager->partitions[0],
-							      false);
+							      &manager->partitions[0]);
 	}
 	spin_unlock_irqrestore(&manager->lock, flags);
 
 	//For ctlr+c app exit
 	if (!multi_process && abort_cmd_pool)
 		aipu_job_manager_abort_cmd_pool(manager);
+
+	/*
+	 * the multi_process guard: with foreign jobs scheduled
+	 * the pool is neither destroyed nor aborted on this close. Correct --
+	 * but it was silent, and this skip is the first breadcrumb of a
+	 * cross-process wedge investigation, so say it happened.
+	 */
+	if (multi_process && abort_cmd_pool)
+		dev_info(manager->dev,
+			 "fd closed with jobs still running; command pool left intact (other processes have jobs scheduled)\n");
 
 	mutex_lock(&manager->wq_lock);
 	for (job_index = 0; job_index < job_total; job_index++) {
@@ -1257,14 +1599,37 @@ int aipu_job_manager_get_job_status(struct aipu_job_manager *manager,
 	}
 	spin_unlock_irqrestore(&manager->lock, flags);
 
-	/* V3 custom IOVA: flush+invalidate all DMA buffers for this filp
-	 * to ensure CPU sees NPU DMA writes.  Without this, dirty cache
-	 * lines from __GFP_ZERO or previous allocations can be evicted
-	 * after NPU writes, overwriting output data in DRAM.
+	/*
+	 * No cache maintenance on harvest. Every alias of
+	 * NPU-written memory is uncached: user mappings are Normal-NC
+	 * (aipu_mm_mmap_buf), the kernel vmap alias is pgprot_noncached,
+	 * and the linear map is only ever CPU-written at allocation time,
+	 * where alloc_phy_and_map clean+invalidates each block. Post-alloc
+	 * the linear map can hold only clean speculative lines, whose
+	 * eviction is architecturally silent -- so the whole-fd
+	 * clean+invalidate walk that lived here (O(live REUSE+STACK bytes)
+	 * under buffer_mutex, once per completion: 12% of a small-graph
+	 * inference, 8.5 ms of a VAE decode) maintained lines no reader
+	 * ever consumed.
 	 */
-	if (job_status->poll_cnt > 0 && manager->mm &&
-	    manager->mm->use_v3_custom_iova)
-		aipu_mm_v3_flush_all_for_filp(manager->mm, filp);
+
+	/*
+	 * deliver the statuses before destroying the jobs: they
+	 * were unlinked under the lock above, so a failed copy can relink
+	 * them and report -EFAULT (not the raw residual, a positive
+	 * "success") instead of freeing completion records the caller never
+	 * received and can never re-poll.
+	 */
+	if (copy_to_user((struct job_status_desc __user *)job_status->status, status,
+			 job_status->poll_cnt * sizeof(*status))) {
+		spin_lock_irqsave(&manager->lock, flags);
+		for (poll_iter = 0; poll_iter < job_status->poll_cnt; poll_iter++)
+			list_add_tail(&done_jobs[poll_iter]->node,
+				      &manager->scheduled_head->node);
+		spin_unlock_irqrestore(&manager->lock, flags);
+		ret = -EFAULT;
+		goto out;
+	}
 
 	mutex_lock(&manager->wq_lock);
 	for (poll_iter = 0; poll_iter < job_status->poll_cnt; poll_iter++) {
@@ -1273,9 +1638,7 @@ int aipu_job_manager_get_job_status(struct aipu_job_manager *manager,
 	}
 	mutex_unlock(&manager->wq_lock);
 
-	ret = copy_to_user((struct job_status_desc __user *)job_status->status, status,
-			   job_status->poll_cnt * sizeof(*status));
-
+out:
 	kfree(status);
 	kfree(done_jobs);
 	return ret;
@@ -1353,21 +1716,30 @@ int aipu_job_manager_get_running_job_thread(struct aipu_job_manager *manager,
 	unsigned long flags;
 	struct aipu_job *curr = NULL;
 	unsigned int core_i = 0;
-	struct aipu_partition partition;
+	unsigned int max_cnt = 0;
 
 	if (!manager || !query)
 		return -EINVAL;
 
 	if (manager->version < AIPU_ISA_VERSION_ZHOUYI_V3)
 		return 0;
-	partition = manager->partitions[0];
+
+	/*
+	 * this read replaces an unsynchronised ~600-byte struct
+	 * copy (two mutexes included, owner/waiter state and all); the loop
+	 * bound is capped by the UAPI array so a core-count bump can never
+	 * write past the caller's thread_id[] (the old bound also wrote
+	 * core_cnt + 1 entries).
+	 */
+	max_cnt = min_t(unsigned int, manager->partitions[0].clusters[0].core_cnt,
+			ARRAY_SIZE(query->thread_id));
 	spin_lock_irqsave(&manager->lock, flags);
 	list_for_each_entry(curr, &manager->scheduled_head->node, node) {
 		if (curr->state == AIPU_JOB_STATE_RUNNING) {
+			if (core_i == max_cnt)
+				break;
 			query->thread_id[core_i] = curr->uthread_id;
 			core_i++;
-			if (core_i > partition.clusters[0].core_cnt)
-				break;
 		}
 	}
 	spin_unlock_irqrestore(&manager->lock, flags);
@@ -1442,7 +1814,7 @@ int aipu_job_manager_config_clusters(struct aipu_job_manager *manager,
 			goto unlock;
 		}
 		partition->ops->enable_core_cnt(partition, idx, en_count);
-		aipu_job_manager_destroy_command_pool_no_lock(manager, partition, true);
+		aipu_job_manager_destroy_command_pool_no_lock(manager, partition);
 	}
 
 	atomic_set(&manager->is_suspend, !en_count);
@@ -1475,10 +1847,33 @@ int aipu_job_manager_resume(struct aipu_job_manager *manager)
 	if (!manager)
 		return -EINVAL;
 
+	/*
+	 * config_clusters programs every cluster's en_core_cnt,
+	 * so the ones after [0] must not come from stack garbage — suspend
+	 * (above) already clears its cfg.
+	 */
+	memset(&cfg, 0, sizeof(cfg));
+
 	cfg.clusters[0].en_core_cnt = manager->partitions[0].clusters[0].core_cnt;
 
-	if (manager->version >= AIPU_ISA_VERSION_ZHOUYI_V3)
-		return aipu_job_manager_config_clusters(manager, &cfg);
+	if (manager->version >= AIPU_ISA_VERSION_ZHOUYI_V3) {
+		int ret = aipu_job_manager_config_clusters(manager, &cfg);
+
+		if (ret)
+			return ret;
+
+		/*
+		 * CMD_POOL_INTR_CTRL does not survive the power
+		 * domain dropping, and probe is the only unconditional
+		 * write: without this restore, a client that never sets
+		 * task.pprint dispatches with every interrupt source
+		 * masked and its jobs complete unreported.
+		 * Write the mask the software state says is armed.
+		 */
+		manager->partitions[0].ops->enable_interrupt(&manager->partitions[0],
+							     manager->tec_intr_en);
+		return 0;
+	}
 
 	atomic_set(&manager->is_suspend, 0);
 	return 0;
@@ -1491,7 +1886,18 @@ int aipu_job_manager_alloc_grid_id(struct aipu_job_manager *manager)
 	if (!manager)
 		return -EINVAL;
 
+	/*
+	 * grid IDs have no free path by design (UAPI: "do not
+	 * need to free"), so the u16 counter must saturate, not wrap into
+	 * IDs that may still be live -- an unprivileged tight loop reaches
+	 * the wrap in under a second. Widening the ID is UAPI-frozen.
+	 */
 	mutex_lock(&manager->id_lock);
+	if (manager->grid_id == U16_MAX) {
+		mutex_unlock(&manager->id_lock);
+		dev_warn_once(manager->dev, "grid IDs exhausted (u16, no free path)\n");
+		return -ENOSPC;
+	}
 	id = manager->grid_id++;
 	mutex_unlock(&manager->id_lock);
 

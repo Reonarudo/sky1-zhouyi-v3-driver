@@ -6,7 +6,6 @@
 
 #include <linux/sizes.h>
 
-#define AIPU_CONFIG_MAX_RESERVED_REGIONS    32
 #define AIPU_CONFIG_DEFAULT_RESET_DELAY_US  50
 #define AIPU_CONFIG_CORE_RESET_DELAY_US     140
 

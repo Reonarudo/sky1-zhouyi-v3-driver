@@ -16,11 +16,13 @@ static int init_aipu_partition(struct aipu_partition *partition, u32 *clusters, 
 	u32 cluster_cnt = 0;
 	u32 iter = 0;
 	u32 val = 0;
+	u32 gm_ctrl = 0;
 
 	if (!partition || !clusters || !p_dev || !tot_cluster)
 		return -EINVAL;
 
-	WARN_ON(!partition->priv);
+	if (WARN_ON(!partition->priv))
+		return -EINVAL;
 
 	partition->arch = AIPU_ARCH_ZHOUYI;
 	partition->dev = &p_dev->dev;
@@ -32,8 +34,6 @@ static int init_aipu_partition(struct aipu_partition *partition, u32 *clusters, 
 
 	/* unused fields */
 	partition->reg_attr = NULL;
-	partition->clk_attr = NULL;
-	partition->disable_attr = NULL;
 	partition->config = 0;
 	partition->max_sched_num = 0;
 	partition->dtcm_base = 0;
@@ -45,17 +45,25 @@ static int init_aipu_partition(struct aipu_partition *partition, u32 *clusters, 
 		if (partition->id == clusters[2 * iter + 1]) {
 			cluster_cnt++;
 			partition->clusters[cluster_cnt - 1].id = clusters[2 * iter];
-			val = aipu_read32(partition->reg, CLUSTER_CONFIG_REG(clusters[2 * iter]));
+			aipu_read32(partition->reg, CLUSTER_CONFIG_REG(clusters[2 * iter]), &val);
 			partition->clusters[cluster_cnt - 1].core_cnt = GET_AIPU_CORE_NUM(val);
 			atomic_set(&partition->clusters[cluster_cnt - 1].en_core_cnt,
 				   GET_AIPU_CORE_NUM(val));
 			partition->clusters[cluster_cnt - 1].tec_cnt = GET_TEC_NUM(val);
 
+			/*
+			 * the misc device is already public while
+			 * this runs, and zhouyi_v3_read_cluster_status() holds
+			 * page_lock for the identical select/read/disable
+			 * window -- this probe-time instance must too.
+			 */
+			mutex_lock(&partition->page_lock);
 			aipu_write32(partition->reg, DEBUG_PAGE_SELECTION_REG,
 				     SELECT_DEBUG_CORE(0, 0));
-			partition->clusters[cluster_cnt - 1].gm_bytes =
-				get_gm_size(aipu_read32(partition->reg, DEBUG_CLUSTER_GM_CONTROL));
+			aipu_read32(partition->reg, DEBUG_CLUSTER_GM_CONTROL, &gm_ctrl);
 			aipu_write32(partition->reg, DEBUG_PAGE_SELECTION_REG, DISABLE_DEBUG);
+			mutex_unlock(&partition->page_lock);
+			partition->clusters[cluster_cnt - 1].gm_bytes = get_gm_size(gm_ctrl);
 			ret = aipu_mm_init_gm(&partition->priv->mm,
 					      partition->clusters[cluster_cnt - 1].gm_bytes);
 		}
@@ -64,8 +72,13 @@ static int init_aipu_partition(struct aipu_partition *partition, u32 *clusters, 
 	partition->cluster_cnt = cluster_cnt;
 	partition->ops->initialize(partition);
 
+	/*
+	 * 0600, was 0644: the show handler dumps 23 live TSM/
+	 * command-pool registers and force-resumes the NPU's power domains
+	 * to do it -- not a read to hand any local account.
+	 */
 	if (IS_ERR(aipu_common_create_attr(partition->dev, &partition->reg_attr, "ext_registers",
-					   0644, aipu_common_ext_register_sysfs_show,
+					   0600, aipu_common_ext_register_sysfs_show,
 					   aipu_common_ext_register_sysfs_store)))
 		dev_err(partition->dev, "[init_partition] init sysfs <ext_registers> failed");
 
@@ -78,7 +91,6 @@ static struct aipu_partition *v3_create_partitions(struct aipu_priv *aipu,
 {
 	int ret = 0;
 	int version = 0;
-	int config = 0;
 	struct aipu_partition *partitions = NULL;
 	u32 *cluster_arr = NULL;
 	u32 cluster_cnt = 0;
@@ -89,12 +101,16 @@ static struct aipu_partition *v3_create_partitions(struct aipu_priv *aipu,
 	if (!aipu || !p_dev)
 		return ERR_PTR(-EINVAL);
 
-	zhouyi_detect_aipu_version(p_dev, &version, &config, NULL);
+	/*
+	 * init_aipu_priv() already detected the version through a
+	 * full map/read/unmap of this same register window; reuse its result
+	 * instead of mapping the window a second time.
+	 */
+	version = aipu->version;
 	dev_info(&p_dev->dev, "AIPU detected: zhouyi-v3\n");
 
 	WARN_ON(!aipu->is_init);
 
-	/* Get cluster count (by default 1) */
 	/*
 	 * Cluster-partition attribute should be in the following format:
 	 *	cluster-partition = <cluster_id0 partition_idx>, <cluster_id1 partition_idy>,
@@ -104,19 +120,29 @@ static struct aipu_partition *v3_create_partitions(struct aipu_priv *aipu,
 	 */
 	ret = device_property_count_u32(&p_dev->dev, "cluster-partition");
 	if (ret <= 0) {
-		dev_warn(&p_dev->dev, "use the default config (1 cluster)");
-		ret = 2;
+		/*
+		 * the old "use the default config (1 cluster)"
+		 * fallback could never work: it re-read the same absent
+		 * property four lines down and failed anyway. Fail
+		 * with the honest cause instead.
+		 */
+		dev_err(&p_dev->dev,
+			"check your dts or acpi table: no cluster-partition property");
+		return ERR_PTR(-EINVAL);
 	}
 
 	cluster_cnt = ret >> 1;
 	WARN_ON(!cluster_cnt);
 
 	cluster_arr = devm_kzalloc(&p_dev->dev, cluster_cnt * 2 * sizeof(u32), GFP_KERNEL);
+	if (!cluster_arr)
+		return ERR_PTR(-ENOMEM);
 
 	if (device_property_read_u32_array(&p_dev->dev, "cluster-partition", cluster_arr,
 			cluster_cnt * 2)) {
 		dev_err(&p_dev->dev, "check your dts or acpi table: read cluster-partition failed");
-		return ERR_PTR(-EINVAL);
+		partitions = ERR_PTR(-EINVAL);
+		goto finish;
 	}
 
 	for (iter = 0; iter < cluster_cnt; iter++) {
@@ -125,36 +151,56 @@ static struct aipu_partition *v3_create_partitions(struct aipu_priv *aipu,
 	}
 
 	partitions = devm_kzalloc(&p_dev->dev, sizeof(*partitions) * partition_cnt, GFP_KERNEL);
-	if (!partitions)
-		return ERR_PTR(-ENOMEM);
+	if (!partitions) {
+		partitions = ERR_PTR(-ENOMEM);
+		goto finish;
+	}
 
 	/* register base and interrupt are shared among all partitions */
 	/* do this before calling init_aipu_partition() */
 	ret = aipu_common_init_reg_irq(p_dev, &partitions[0], &aipu->reg, &aipu->irq_obj);
-	if (ret)
-		return ERR_PTR(ret);
+	if (ret) {
+		partitions = ERR_PTR(ret);
+		goto finish;
+	}
 
 	/* global soft-reset before per partition config */
 	ret = aipu->ops->global_soft_reset(aipu);
 	if (ret) {
 		dev_err(&p_dev->dev, "[init partition] global soft reset failed");
-		return ERR_PTR(ret);
+		goto err_unwind_reg_irq;
 	}
 
-	build_info = aipu_read32(&aipu->reg, TSM_BUILD_INFO_REG);
+	aipu_read32(&aipu->reg, TSM_BUILD_INFO_REG, &build_info);
 	aipu->max_partition_cnt = GET_MAX_PARTITION_NUM(build_info);
 	aipu->max_cmd_pool_cnt = GET_MAX_CMD_POOL_NUM(build_info);
 
-	WARN_ON(partition_cnt > aipu->max_partition_cnt);
-	WARN_ON(partition_cnt > aipu->max_cmd_pool_cnt);
-	WARN_ON(cluster_cnt > MAX_CLUSTER_NUM);
+	/*
+	 * these bounds were WARN_ON'ed and then used: a
+	 * cluster-partition table past the hardware's limits overflowed
+	 * partition->clusters[8] and misconfigured the TSM regardless.
+	 */
+	if (partition_cnt > aipu->max_partition_cnt ||
+	    partition_cnt > aipu->max_cmd_pool_cnt ||
+	    cluster_cnt > MAX_CLUSTER_NUM) {
+		dev_err(&p_dev->dev,
+			"invalid cluster-partition: %u partitions (hw max %u, cmd pools %u), %u clusters (max %u)",
+			partition_cnt, aipu->max_partition_cnt,
+			aipu->max_cmd_pool_cnt, cluster_cnt, MAX_CLUSTER_NUM);
+		ret = -EINVAL;
+		goto err_unwind_reg_irq;
+	}
 
 	/* check if clusters are all present after reg init */
 	for (iter = 0; iter < cluster_cnt; iter++) {
-		if (!IS_CLUSTER_PRESENT(aipu_read32(&aipu->reg, CLUSTER_CONFIG_REG(iter)))) {
+		u32 cluster_cfg = 0;
+
+		aipu_read32(&aipu->reg, CLUSTER_CONFIG_REG(iter), &cluster_cfg);
+		if (!IS_CLUSTER_PRESENT(cluster_cfg)) {
 			dev_err(&p_dev->dev,
 				"AIPU cluster #%d was not found but registered in dts\n", iter);
-			return ERR_PTR(-EINVAL);
+			ret = -EINVAL;
+			goto err_unwind_reg_irq;
 		}
 	}
 
@@ -167,15 +213,34 @@ static struct aipu_partition *v3_create_partitions(struct aipu_priv *aipu,
 			goto init_partition_fail;
 	}
 
+	/*
+	 * this call can now fail (its two allocations used to go
+	 * unchecked into a probe-time NULL deref); order it before the aipu
+	 * fields are set so the failure unwind below leaves no stale state.
+	 */
+	ret = aipu_job_manager_set_partitions_info(&aipu->job_manager, partition_cnt,
+						   partitions);
+	if (ret)
+		goto init_partition_fail;
+
 	aipu->partitions = partitions;
 	aipu->partition_cnt = partition_cnt;
 	aipu->cluster_cnt = cluster_cnt;
-	aipu_job_manager_set_partitions_info(&aipu->job_manager, aipu->partition_cnt,
-					     aipu->partitions);
 	partitions[0].ops->print_hw_id_info(&partitions[0]);
 	goto finish;
 
 init_partition_fail:
+	/*
+	 * aipu->partition_cnt is still 0 here, so
+	 * v3_destroy_partitions() can never reach the ext_registers
+	 * attributes created for the partitions that did initialize --
+	 * their show handler would dereference the freed array below.
+	 * Sweep the whole array: reg_attr is NULL wherever creation
+	 * did not happen.
+	 */
+	for (iter = 0; iter < partition_cnt; iter++)
+		aipu_common_destroy_attr(partitions[iter].dev, &partitions[iter].reg_attr);
+err_unwind_reg_irq:
 	aipu_destroy_irq_object(aipu->irq_obj);
 	aipu->irq_obj = NULL;
 	deinit_aipu_ioregion(&aipu->reg);
@@ -217,6 +282,7 @@ static int v3_global_soft_reset(struct aipu_priv *aipu)
 static int zhouyi_v3_read_cluster_status(struct aipu_priv *aipu, struct aipu_cluster_status *status)
 {
 	int i = 1;
+	u32 val = 0;
 
 	if (unlikely(!status))
 		return -EINVAL;
@@ -226,12 +292,14 @@ static int zhouyi_v3_read_cluster_status(struct aipu_priv *aipu, struct aipu_clu
 
 	mutex_lock(&aipu->partitions[0].page_lock);
 	aipu_write32(&aipu->reg, DEBUG_PAGE_SELECTION_REG, SELECT_DEBUG_CORE(0, 0));
-	status->cluster_status = aipu_read32(&aipu->reg, DEBUG_CLUSTER_STATUS);
-	status->core_status = (aipu_read32(&aipu->reg, DEBUG_CORE_STATUS) >> 4) & 0b1;
+	aipu_read32(&aipu->reg, DEBUG_CLUSTER_STATUS, &val);
+	status->cluster_status = val;
+	aipu_read32(&aipu->reg, DEBUG_CORE_STATUS, &val);
+	status->core_status = (val >> 4) & 0b1;
 	for (; i < atomic_read(&aipu->partitions[0].clusters[0].en_core_cnt); ++i) {
 		aipu_write32(&aipu->reg, DEBUG_PAGE_SELECTION_REG, SELECT_DEBUG_CORE(0, i));
-		status->core_status |= (((aipu_read32(&aipu->reg, DEBUG_CORE_STATUS) >> 4)
-								& 0b1) << i);
+		aipu_read32(&aipu->reg, DEBUG_CORE_STATUS, &val);
+		status->core_status |= (((val >> 4) & 0b1) << i);
 	}
 	aipu_write32(&aipu->reg, DEBUG_PAGE_SELECTION_REG, DISABLE_DEBUG);
 	mutex_unlock(&aipu->partitions[0].page_lock);

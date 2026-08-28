@@ -18,16 +18,6 @@ ssize_t aipu_common_ext_register_sysfs_show(struct device *dev,
 ssize_t aipu_common_ext_register_sysfs_store(struct device *dev,
 					     struct device_attribute *attr,
 					     const char *buf, size_t count);
-ssize_t aipu_common_clock_sysfs_show(struct device *dev,
-				     struct device_attribute *attr,
-				     char *buf);
-ssize_t aipu_common_clock_sysfs_store(struct device *dev,
-				      struct device_attribute *attr,
-				      const char *buf, size_t count);
-ssize_t aipu_common_disable_sysfs_show(struct device *dev, struct device_attribute *attr,
-				       char *buf);
-ssize_t aipu_common_disable_sysfs_store(struct device *dev, struct device_attribute *attr,
-					const char *buf, size_t count);
 struct device_attribute *aipu_common_create_attr(struct device *dev,
 						 struct device_attribute **attr,
 						 const char *name, int mode,

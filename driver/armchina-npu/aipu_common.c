@@ -20,7 +20,6 @@ ssize_t aipu_common_ext_register_sysfs_show(struct device *dev,
 					    char *buf)
 {
 	int ret = 0;
-	char tmp[512];
 	struct platform_device *p_dev = container_of(dev, struct platform_device, dev);
 	struct aipu_priv *aipu = platform_get_drvdata(p_dev);
 	struct aipu_partition *partition = aipu->partitions;
@@ -31,26 +30,19 @@ ssize_t aipu_common_ext_register_sysfs_show(struct device *dev,
 #ifdef CONFIG_SKY1
        sky1_npu_pm_runtime_get_sync(aipu->dev);
 #endif
-	if (get_soc_ops(partition) &&
-	    get_soc_ops(partition)->is_clk_enabled &&
-	    !get_soc_ops(partition)->is_clk_enabled(dev, get_soc(partition))) {
-		return snprintf(buf, MAX_CHAR_SYSFS,
-		    "AIPU is suspended and external registers cannot be read!\n");
-	}
 
-	ret += snprintf(tmp, 512, "----------------------------------------------\n");
-	strcat(buf, tmp);
-	ret += snprintf(tmp, 512, "   AIPU External Register Values\n");
-	strcat(buf, tmp);
-	ret += snprintf(tmp, 512, "----------------------------------------------\n");
-	strcat(buf, tmp);
-	ret += snprintf(tmp, 512, "%-*s%-*s%-*s\n", 8, "Offset", 28, "Name", 10, "Value");
-	strcat(buf, tmp);
-	ret += snprintf(tmp, 512, "----------------------------------------------\n");
-	strcat(buf, tmp);
-	ret += partition->ops->sysfs_show(partition, buf);
-	ret += snprintf(tmp, 512, "----------------------------------------------\n");
-	strcat(buf, tmp);
+	/*
+	 * this chain used to snprintf into a 512-byte stack
+	 * buffer and strcat onto the page with no PAGE_SIZE accounting;
+	 * sysfs_emit_at owns the bound now.
+	 */
+	ret += sysfs_emit_at(buf, ret, "----------------------------------------------\n");
+	ret += sysfs_emit_at(buf, ret, "   AIPU External Register Values\n");
+	ret += sysfs_emit_at(buf, ret, "----------------------------------------------\n");
+	ret += sysfs_emit_at(buf, ret, "%-*s%-*s%-*s\n", 8, "Offset", 28, "Name", 10, "Value");
+	ret += sysfs_emit_at(buf, ret, "----------------------------------------------\n");
+	ret += partition->ops->sysfs_show(partition, buf, ret);
+	ret += sysfs_emit_at(buf, ret, "----------------------------------------------\n");
 
 #ifdef CONFIG_SKY1
        sky1_npu_pm_runtime_put(aipu->dev);
@@ -65,42 +57,55 @@ ssize_t aipu_common_ext_register_sysfs_store(struct device *dev,
 	struct platform_device *p_dev = container_of(dev, struct platform_device, dev);
 	struct aipu_priv *aipu = platform_get_drvdata(p_dev);
 	struct aipu_partition *partition = aipu->partitions;
-	int ret = 0;
+	int ret = count;
 	int value[2] = { 0 };
 	struct aipu_io_req io_req;
 
-	if (get_soc_ops(partition) &&
-	    get_soc_ops(partition)->is_clk_enabled &&
-	    !get_soc_ops(partition)->is_clk_enabled(dev, get_soc(partition)))
-		return 0;
+	/* the show sibling guards this; store dereferenced NULL */
+	if (unlikely(!partition))
+		return count;
 
 #ifdef CONFIG_SKY1
        sky1_npu_pm_runtime_get_sync(aipu->dev);
 #endif
 
-	ret = sscanf(buf, "%x %x", &value[0], &value[1]);
-	if (ret == ADDR_VALUE) {
-		io_req.rw = AIPU_IO_WRITE;
-		io_req.offset = value[0];
-		io_req.value = value[1];
-		dev_info(dev, "[SYSFS] write 0x%x into register offset 0x%x", value[1], value[0]);
-		if (io_req.offset % 4 == 0) {
-			partition->ops->io_rw(partition, &io_req);
-		} else {
-			dev_err(dev, "0x%x invalid address! 4 bytes alignment!\n", value[0]);
-			return -EINVAL;
-		}
-	} else {
+	/*
+	 * every exit below drops the runtime-PM reference through
+	 * out_put: the malformed-input branches used to return -EINVAL
+	 * directly, leaking a reference each until the NPU could never
+	 * runtime-suspend again -- a handful of typos and the cores stay
+	 * powered for the module's life.
+	 */
+	if (sscanf(buf, "%x %x", &value[0], &value[1]) != ADDR_VALUE) {
 		dev_info(dev, "echo \"addr_hex  value_hex\" > ext_registers\n");
-		return -EINVAL;
+		ret = -EINVAL;
+		goto out_put;
 	}
 
+	/*
+	 * io_req is stack memory: partition_id and reg_type were
+	 * left uninitialized, and io_rw now refuses reg_type != AIPU_HOST_REG
+	 * -- garbage here would randomly reject root's writes.
+	 */
+	io_req.partition_id = 0;
+	io_req.reg_type = AIPU_HOST_REG;
+	io_req.rw = AIPU_IO_WRITE;
+	io_req.offset = value[0];
+	io_req.value = value[1];
+	dev_info(dev, "[SYSFS] write 0x%x into register offset 0x%x", value[1], value[0]);
+	if (io_req.offset % 4 != 0) {
+		dev_err(dev, "0x%x invalid address! 4 bytes alignment!\n", value[0]);
+		ret = -EINVAL;
+		goto out_put;
+	}
+	partition->ops->io_rw(partition, &io_req);
 
+out_put:
 #ifdef CONFIG_SKY1
        sky1_npu_pm_runtime_put(aipu->dev);
 #endif
 
-	return count;
+	return ret;
 
 
 
@@ -112,115 +117,6 @@ ssize_t aipu_common_ext_register_sysfs_store(struct device *dev,
 
 
 
-
-
-
-
-}
-
-ssize_t aipu_common_clock_sysfs_show(struct device *dev,
-				     struct device_attribute *attr,
-				     char *buf)
-{
-	struct platform_device *p_dev = container_of(dev, struct platform_device, dev);
-	struct aipu_priv *aipu = platform_get_drvdata(p_dev);
-	struct aipu_partition *partition = aipu->partitions;
-
-	/*
-	 * If SoC level provides no clock operations,
-	 * the state of AIPU is by default treated as normal.
-	 */
-	if (get_soc_ops(partition) &&
-	    get_soc_ops(partition)->is_clk_enabled &&
-	    !get_soc_ops(partition)->is_clk_enabled(dev, get_soc(partition)))
-		return snprintf(buf, MAX_CHAR_SYSFS,
-				"AIPU is in clock gating state and suspended.\n");
-	else
-		return snprintf(buf, MAX_CHAR_SYSFS, "AIPU is in normal working state.\n");
-}
-
-ssize_t aipu_common_clock_sysfs_store(struct device *dev,
-				      struct device_attribute *attr,
-				      const char *buf, size_t count)
-{
-	int do_suspend = 0;
-	int do_resume = 0;
-	struct platform_device *p_dev = container_of(dev, struct platform_device, dev);
-	struct aipu_priv *aipu = platform_get_drvdata(p_dev);
-	struct aipu_partition *partition = aipu->partitions;
-
-	if (unlikely(!partition))
-		return count;
-
-	if (!get_soc_ops(partition) ||
-	    !get_soc_ops(partition)->enable_clk ||
-	    !get_soc_ops(partition)->disable_clk ||
-	    !get_soc_ops(partition)->is_clk_enabled) {
-		dev_info(dev, "operation is not supported.\n");
-		return count;
-	}
-
-	if ((strncmp(buf, "1", 1) == 0))
-		do_suspend = 1;
-	else if ((strncmp(buf, "0", 1) == 0))
-		do_resume = 1;
-
-	if (get_soc_ops(partition)->is_clk_enabled(dev, get_soc(partition)) &&
-	    partition->ops->is_idle(partition) && do_suspend) {
-		dev_info(dev, "disable clock\n");
-		get_soc_ops(partition)->disable_clk(partition->dev, get_soc(partition));
-	} else if (!get_soc_ops(partition)->is_clk_enabled(dev, get_soc(partition)) && do_resume) {
-		dev_info(dev, "enable clock\n");
-		get_soc_ops(partition)->enable_clk(partition->dev, get_soc(partition));
-	} else {
-		dev_err(dev, "operation cannot be completed!\n");
-	}
-
-	return count;
-}
-
-ssize_t aipu_common_disable_sysfs_show(struct device *dev, struct device_attribute *attr,
-				       char *buf)
-{
-	struct platform_device *p_dev = container_of(dev, struct platform_device, dev);
-	struct aipu_priv *aipu = platform_get_drvdata(p_dev);
-	struct aipu_partition *partition = aipu->partitions;
-
-	if (atomic_read(&partition->disable)) {
-		return snprintf(buf, MAX_CHAR_SYSFS,
-		    "AIPU partition #%d is disabled (echo 0 > /sys/devices/platform/[dev]/disable to enable it).\n",
-		    partition->id);
-	} else {
-		return snprintf(buf, MAX_CHAR_SYSFS,
-		    "AIPU partition #%d is enabled (echo 1 > /sys/devices/platform/[dev]/disable to disable it).\n",
-		    partition->id);
-	}
-}
-
-ssize_t aipu_common_disable_sysfs_store(struct device *dev, struct device_attribute *attr,
-					const char *buf, size_t count)
-{
-	int do_disable = 0;
-	struct platform_device *p_dev = container_of(dev, struct platform_device, dev);
-	struct aipu_priv *aipu = platform_get_drvdata(p_dev);
-	struct aipu_partition *partition = aipu->partitions;
-
-	if ((strncmp(buf, "1", 1) == 0))
-		do_disable = 1;
-	else if ((strncmp(buf, "0", 1) == 0))
-		do_disable = 0;
-	else
-		do_disable = -1;
-
-	if (atomic_read(&partition->disable) && !do_disable) {
-		dev_info(dev, "enable partition...\n");
-		atomic_set(&partition->disable, 0);
-	} else if (!atomic_read(&partition->disable) && do_disable) {
-		dev_info(dev, "disable partition...\n");
-		atomic_set(&partition->disable, 1);
-	}
-
-	return count;
 }
 
 struct device_attribute *aipu_common_create_attr(struct device *dev,
@@ -228,6 +124,8 @@ struct device_attribute *aipu_common_create_attr(struct device *dev,
 						 const char *name, int mode,
 						 sysfs_show_t show, sysfs_store_t store)
 {
+	int ret;
+
 	if (!dev || !attr || !name)
 		return ERR_PTR(-EINVAL);
 
@@ -235,11 +133,24 @@ struct device_attribute *aipu_common_create_attr(struct device *dev,
 	if (!*attr)
 		return ERR_PTR(-ENOMEM);
 
+	/* dynamically allocated: lockdep needs the init */
+	sysfs_attr_init(&(*attr)->attr);
 	(*attr)->attr.name = name;
 	(*attr)->attr.mode = mode;
 	(*attr)->show = show;
 	(*attr)->store = store;
-	device_create_file(dev, *attr);
+
+	/*
+	 * unchecked, a failed registration left *attr pointing
+	 * at an attribute that is not in sysfs, which destroy would then
+	 * device_remove_file().
+	 */
+	ret = device_create_file(dev, *attr);
+	if (ret) {
+		kfree(*attr);
+		*attr = NULL;
+		return ERR_PTR(ret);
+	}
 
 	return *attr;
 }

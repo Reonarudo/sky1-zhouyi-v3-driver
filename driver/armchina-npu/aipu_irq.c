@@ -95,13 +95,20 @@ finish:
 void aipu_destroy_irq_object(struct aipu_irq_object *irq_obj)
 {
 	if (irq_obj) {
+		/*
+		 * the interrupt must go first: while it is live,
+		 * the upper half can queue into aipu_wq, so destroying the
+		 * workqueue (or freeing irq_obj) before free_irq() left a
+		 * window where a late interrupt ran queue_work(NULL, ...) or
+		 * used the freed object.
+		 */
+		if (irq_obj->irqnum)
+			free_irq(irq_obj->irqnum, irq_obj->dev);
 		if (irq_obj->aipu_wq) {
 			flush_workqueue(irq_obj->aipu_wq);
 			destroy_workqueue(irq_obj->aipu_wq);
 			irq_obj->aipu_wq = NULL;
 		}
-		if (irq_obj->irqnum)
-			free_irq(irq_obj->irqnum, irq_obj->dev);
 		kfree(irq_obj);
 	}
 }
@@ -112,7 +119,7 @@ void aipu_destroy_irq_object(struct aipu_irq_object *irq_obj)
  */
 void aipu_irq_schedulework(struct aipu_irq_object *irq_obj)
 {
-	if (irq_obj)
+	if (irq_obj && irq_obj->aipu_wq)
 		queue_work(irq_obj->aipu_wq, &irq_obj->work);
 }
 
@@ -122,5 +129,6 @@ void aipu_irq_schedulework(struct aipu_irq_object *irq_obj)
  */
 void aipu_irq_flush_workqueue(struct aipu_irq_object *irq_obj)
 {
-	flush_workqueue(irq_obj->aipu_wq);
+	if (irq_obj && irq_obj->aipu_wq)
+		flush_workqueue(irq_obj->aipu_wq);
 }

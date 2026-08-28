@@ -17,6 +17,17 @@ struct aipu_dma_buf_priv {
 	void *va;
 	struct page **pages;  /* source pages from aipu_phy_block (scattered) */
 	u32 page_count;       /* number of pages */
+	/*
+	 * The backing allocation outlives the fd that created it -- an exported
+	 * dma_buf may be passed to another process or held by an attached
+	 * device -- so it is reclaimed by refcount, in aipu_dma_release, not at
+	 * fd close. @reclaimed records that FREE_DMA_BUF got there first, and
+	 * @lock serialises that reclaim against the dma_buf ops that read
+	 * @pages/@va/@dev_pa, so none of them can act on a freed allocation.
+	 * This struct itself belongs to the dma_buf and dies with it.
+	 */
+	struct mutex lock;
+	bool reclaimed;
 };
 
 struct aipu_dma_buf_importer {

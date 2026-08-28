@@ -29,8 +29,6 @@ static void deinit_misc_dev(struct aipu_priv *aipu)
  * @aipu:  pointer to the aipu private struct to be initialized
  * @p_dev: pointer to the platform device struct
  * @fops:  pointer to the file_operations struct
- * @soc:   pointer to the SoC private data structure
- * @soc_ops: pointer to the SoC operations struct
  *
  * This function should be called while driver probing. It should be called
  * only one time.
@@ -38,8 +36,7 @@ static void deinit_misc_dev(struct aipu_priv *aipu)
  * Return: 0 on success and error code otherwise.
  */
 int init_aipu_priv(struct aipu_priv *aipu, struct platform_device *p_dev,
-		   const struct file_operations *fops, struct aipu_soc *soc,
-		   struct aipu_soc_operations *soc_ops)
+		   const struct file_operations *fops)
 {
 	int ret = 0;
 	int version = 0;
@@ -54,8 +51,6 @@ int init_aipu_priv(struct aipu_priv *aipu, struct platform_device *p_dev,
 
 	aipu->dev = &p_dev->dev;
 	aipu->aipu_fops = fops;
-	aipu->soc = soc;
-	aipu->soc_ops = soc_ops;
 	aipu->reset_delay_us = AIPU_CONFIG_DEFAULT_RESET_DELAY_US;
 
 	/* init during partitions creation */
@@ -68,12 +63,16 @@ int init_aipu_priv(struct aipu_priv *aipu, struct platform_device *p_dev,
 	aipu->reg.kern = NULL;
 	aipu->reg.phys = 0;
 	aipu->reg.size = 0;
-	aipu->dbg_reg.kern = NULL;
-	aipu->dbg_reg.phys = 0;
-	aipu->dbg_reg.size = 0;
 	aipu->ops = NULL;
 
-	zhouyi_detect_aipu_version(p_dev, &version, &config, &revision);
+	/*
+	 * a failed detect used to fall through and be reported as
+	 * "unidentified hardware version number: 0" -- the wrong diagnosis for
+	 * a mapping failure. Detect logs its own cause; stop here.
+	 */
+	ret = zhouyi_detect_aipu_version(p_dev, &version, &config, &revision);
+	if (ret)
+		goto finish;
 	dev_dbg(aipu->dev, "AIPU core0 ISA version %d, configuration %d\n", version, config);
 	aipu->version = version;
 	aipu->revision = revision;
@@ -91,21 +90,28 @@ int init_aipu_priv(struct aipu_priv *aipu, struct platform_device *p_dev,
 
 	ret = init_misc_dev(aipu);
 	if (ret)
-		goto err_handle;
+		goto finish;
 
 	ret = aipu_init_mm(&aipu->mm, p_dev, version);
 	if (ret)
-		goto err_handle;
+		goto err_deinit_misc;
 
 	ret = init_aipu_job_manager(&aipu->job_manager, &aipu->mm, aipu);
 	if (ret)
-		goto err_handle;
+		goto err_deinit_mm;
 
 	aipu->is_init = true;
 	goto finish;
 
-err_handle:
-	deinit_aipu_priv(aipu);
+	/*
+	 * staged: the full deinit_aipu_priv() tears down
+	 * subsystems this function never built, which is safe only while
+	 * every sub-struct happens to survive teardown from all-zeroes.
+	 */
+err_deinit_mm:
+	aipu_deinit_mm(&aipu->mm);
+err_deinit_misc:
+	deinit_misc_dev(aipu);
 
 finish:
 	return ret;
@@ -122,11 +128,19 @@ int deinit_aipu_priv(struct aipu_priv *aipu)
 	if (!aipu)
 		return 0;
 
+	/*
+	 * close the front door before tearing anything down:
+	 * /dev/aipu stayed present (and 0666) across the whole teardown, so
+	 * a fresh open() could ioctl into freed caches. is_init clears first
+	 * so the aipu_ioctl gate rejects fds that are already open; the
+	 * partitions (whose destroy frees the IRQ and flushes the workqueue)
+	 * must still go before the job manager the bottom half touches.
+	 */
+	aipu->is_init = 0;
+	deinit_misc_dev(aipu);
 	aipu->ops->destroy_partitions(aipu);
 	deinit_aipu_job_manager(&aipu->job_manager);
 	aipu_deinit_mm(&aipu->mm);
-	deinit_misc_dev(aipu);
-	aipu->is_init = 0;
 
 	return 0;
 }
@@ -174,7 +188,7 @@ int aipu_priv_query_partition_capability(struct aipu_priv *aipu, struct aipu_par
 	u32 core_cnt = 0;
 	u32 en_core_cnt = 0;
 
-	if (unlikely(!aipu && !cap))
+	if (unlikely(!aipu || !cap))
 		return -EINVAL;
 
 	for (id = 0; id < aipu->partition_cnt; id++) {
@@ -184,8 +198,9 @@ int aipu_priv_query_partition_capability(struct aipu_priv *aipu, struct aipu_par
 		cap[id].version = partition->version;
 		cap[id].config = partition->config;
 		cap[id].info.reg_base = partition->reg->phys;
-		cap[id].cluster_cnt = partition->cluster_cnt;
-		for (iter = 0; iter < partition->cluster_cnt; iter++) {
+		cap[id].cluster_cnt = min_t(u32, partition->cluster_cnt,
+					    ARRAY_SIZE(cap[id].clusters));
+		for (iter = 0; iter < cap[id].cluster_cnt; iter++) {
 			core_cnt = partition->clusters[iter].core_cnt;
 			en_core_cnt = atomic_read(&partition->clusters[iter].en_core_cnt);
 
@@ -270,23 +285,18 @@ int aipu_priv_io_rw(struct aipu_priv *aipu, struct aipu_io_req *io_req)
  */
 int aipu_priv_check_status(struct aipu_priv *aipu)
 {
-	if (aipu && aipu->is_init)
+	/*
+	 * is_init alone is not "ready": it goes true at the end
+	 * of init_aipu_priv(), but the partitions are published only when
+	 * create_partitions() completes -- and the misc device is registered
+	 * (0666) in between, so an ioctl in that window used to reach
+	 * partitions[0] == NULL. partitions is the last field the
+	 * probe path publishes; requiring it closes the window at the one
+	 * predicate every entry point already routes through.
+	 */
+	if (aipu && aipu->is_init && aipu->partitions)
 		return 0;
 	return -EINVAL;
-}
-
-inline struct aipu_soc *get_soc(struct aipu_partition *partition)
-{
-	if (partition && partition->priv)
-		return partition->priv->soc;
-	return NULL;
-}
-
-inline struct aipu_soc_operations *get_soc_ops(struct aipu_partition *partition)
-{
-	if (partition && partition->priv)
-		return partition->priv->soc_ops;
-	return NULL;
 }
 
 inline struct aipu_job_manager *get_job_manager(struct aipu_partition *partition)
