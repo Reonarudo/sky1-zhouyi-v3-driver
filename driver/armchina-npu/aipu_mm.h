@@ -99,6 +99,18 @@ struct aipu_phy_block {
 	u64 iova_start;
 	u64 size;
 	u32 page_count;
+	/*
+	 * Kernel alias of this block, or NULL. Created lazily, on the first
+	 * kernel-side resolve of an address inside the block, by
+	 * aipu_mm_v3_block_kva() under the owning buffer's phy_mutex -- NOT at
+	 * allocation, and never from anything the caller said.
+	 * Transitions NULL -> address exactly once and
+	 * never back, published with a release store, so the unlocked readers
+	 * are sound. ⚠️ aipu_map_sg_to_iommu() on the non-custom-IOVA path
+	 * still assigns it directly and ignores vmap failure; that path is
+	 * unreachable on a V3 part with the custom-IOVA domain and was left
+	 * alone rather than dragged into this change's perimeter.
+	 */
 	void* va;
 	struct dma_buf *dmabuf;
 	bool bind_memory;

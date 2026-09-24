@@ -187,6 +187,12 @@ int aipu_alloc_dma_buf(struct aipu_memory_manager *mm, struct aipu_dma_buf_reque
 	 * are about to export, which may outlive the fd asking for it. Name
 	 * ourselves so the memory manager's NULL-owner tripwire knows this
 	 * caller has a reclaim path (aipu_dma_release) -- see aipu_mm.h.
+	 *
+	 * Naming ourselves is ALL this does. It used to double as the request
+	 * for a kernel alias, which made the export path's correctness depend
+	 * on a data_type travelling intact through the allocator -- and the
+	 * vmap-restriction change records the near-miss where it nearly did not.
+	 * The alias is now taken below, by asking for it.
 	 */
 	inter_req.data_type = AIPU_MM_DATA_TYPE_KMD_DMA_BUF;
 

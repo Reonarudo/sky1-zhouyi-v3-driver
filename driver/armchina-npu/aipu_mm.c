@@ -21,6 +21,20 @@
 
 /* Forward declarations for V3 custom IOVA support */
 static int aipu_mm_v3_reserve_never_map_zones(struct aipu_memory_manager *mm);
+static int aipu_mm_v3_block_invalidate(struct aipu_memory_manager *mm,
+				       struct aipu_phy_block *block, u64 offset, u64 size);
+
+/*
+ * Invalidate a range WITHOUT cleaning and without the trailing
+ * barrier -- flush_range_nb's contract, for the other half of the operation.
+ *
+ * A file-static and not a struct __cache_ops member on purpose: that struct is
+ * embedded in struct aipu_memory_manager, so one more pointer in it moves every
+ * field after it and displaces some forty functions that this change does not
+ * touch. The ops table is identical for every mm anyway -- init_cache_ops fills
+ * it from the arch, once -- so a static costs nothing but the symbol.
+ */
+static void (*aipu_invalidate_range_nb)(void *vaddr, size_t size);
 
 #define EXIT_ENCODE_BUF_SIZE (1024)
 struct exporter_dma_buf {
@@ -48,6 +62,7 @@ static struct aipu_tcb_buf *aipu_mm_v3_find_tcb_buf_no_lock(struct aipu_memory_m
 static int init_cache_ops(struct aipu_memory_manager *mm);
 static void aipu_debug_print_buffers(struct aipu_memory_manager *mm);
 static struct aipu_iova_buffer *aipu_get_iova_buffer(struct aipu_memory_manager *mm, u64 iova, char* str);
+static char *aipu_mm_v3_kva_by_pa(struct aipu_memory_manager *mm, u64 dev_pa);
 int aipu_mm_hold_tcb_buf_alloc(struct aipu_memory_manager *mm, struct aipu_job *kern_job)
 {
 	struct aipu_hold_tcb_buf *htbuf = NULL;
@@ -1098,6 +1113,95 @@ static void tensor_flush_dcache_range(void *start, void *end) {
 }
 
 /**
+ * aipu_mm_v3_block_pages_cmo_nb() - CPU cache maintenance over part of a block
+ * @mm:     the memory manager
+ * @block:  the physical block
+ * @offset: byte offset into the block to start at
+ * @size:   bytes to cover (clamped to the block)
+ * @invalidate: invalidate without cleaning first, rather than clean+invalidate
+ *
+ * Through the LINEAR map (page_address), which is the one cacheable alias these
+ * pages have. WITHOUT a completion barrier: every caller issues exactly one
+ * after its last block, which is why this and aipu_mm_v3_flush_block_pages_nb
+ * share it rather than emitting a full-system dsb per 4KB page.
+ *
+ * The user mapping is Normal-NC and the kernel vmap alias
+ * is pgprot_noncached, so maintaining either -- which is what the BUF_CACHE
+ * ioctl pair did until now -- is a no-op, and that is why they "made no
+ * difference" wherever they were tried.
+ *
+ * It is not a no-op on the linear map, and the difference is a live defect: a
+ * CLEAN stale line for these physical addresses survives in the CPU hierarchy
+ * (the allocator's zeroing populates it, and the linear map is speculatively
+ * accessible thereafter), and the host's non-cacheable reads are served from it
+ * for as long as it lives -- measured alive 50 ms after the job completed, and
+ * surviving a second read of the same bytes. Invalidating is what clears it;
+ * cleaning alone does nothing, which is how we know the line is clean.
+ *
+ * Return: 0, or -EOPNOTSUPP if this arch registered no maintenance op -- never
+ * a silent success, which is the failure mode this replaces.
+ */
+static int aipu_mm_v3_block_pages_cmo_nb(struct aipu_memory_manager *mm,
+					 struct aipu_phy_block *block,
+					 u64 offset, u64 size, bool invalidate)
+{
+	void (*op)(void *, size_t);
+	u32 first, last, i;
+
+	if (invalidate)
+		op = aipu_invalidate_range_nb ? aipu_invalidate_range_nb :
+						mm->cache_ops.invalidate_range;
+	else
+		op = mm->cache_ops.flush_range_nb ? mm->cache_ops.flush_range_nb :
+						    mm->cache_ops.flush_range;
+	if (!op)
+		return -EOPNOTSUPP;
+	if (!block->pages)
+		return 0;
+
+	if (offset >= block->size)
+		return 0;
+	size = min(size, block->size - offset);
+	if (!size)
+		return 0;
+
+	first = offset >> PAGE_SHIFT;
+	last = (offset + size - 1) >> PAGE_SHIFT;
+	if (last >= block->page_count)
+		last = block->page_count - 1;
+
+	for (i = first; i <= last; i++) {
+		void *va = page_address(block->pages[i]);
+
+		if (va)
+			op(va, PAGE_SIZE);
+	}
+
+	return 0;
+}
+
+/* The two above, each with the single trailing barrier its caller owes. */
+static int aipu_mm_v3_block_flush(struct aipu_memory_manager *mm,
+				  struct aipu_phy_block *block, u64 offset, u64 size)
+{
+	int ret = aipu_mm_v3_block_pages_cmo_nb(mm, block, offset, size, false);
+
+	if (!ret && mm->cache_ops.flush_barrier)
+		mm->cache_ops.flush_barrier();
+	return ret;
+}
+
+static int aipu_mm_v3_block_invalidate(struct aipu_memory_manager *mm,
+				       struct aipu_phy_block *block, u64 offset, u64 size)
+{
+	int ret = aipu_mm_v3_block_pages_cmo_nb(mm, block, offset, size, true);
+
+	if (!ret && mm->cache_ops.flush_barrier)
+		mm->cache_ops.flush_barrier();
+	return ret;
+}
+
+/**
  * @aipu_mm_cache_flush() - invald buffer allocated by aipu_mm_alloc()
  * @mm:   pointer to memory manager struct initialized in aipu_init_mm()
  * @buf:  pointer to the buffer descriptor to be invalid
@@ -1129,15 +1233,19 @@ int aipu_mm_cache_flush(struct aipu_memory_manager *mm, struct aipu_buf_desc *bu
 
 			block = aipu_mm_v3_find_block_by_iova(mm, iova, asid);
 			if (block) {
-				/* Non-TCB blocks carry no kernel alias since
-				 * the vmap restriction; the user
-				 * mapping is Normal-NC, so there is no dirty
-				 * line to flush. Owned-but-unaliased is a
-				 * no-op success.
+				/* The LINEAR alias, over the
+				 * range the caller named; see
+				 * aipu_mm_v3_block_pages_cmo_nb for why that
+				 * is the alias with something to maintain.
+				 *
+				 * Owned is a success whether or not the block
+				 * carries a kernel alias, so this stays
+				 * invariant in how the caller described its
+				 * allocation.
 				 */
-				if (block->va)
-					aipu_cache_flush(mm, block->va, block->size);
-				return 0;
+				return aipu_mm_v3_block_flush(mm, block,
+							      iova - block->iova_start,
+							      buf->bytes);
 			}
 		}
 		/*
@@ -1201,15 +1309,19 @@ int aipu_mm_cache_invalid(struct aipu_memory_manager *mm, struct aipu_buf_desc *
 
 			block = aipu_mm_v3_find_block_by_iova(mm, iova, asid);
 			if (block) {
-				/* Non-TCB blocks carry no kernel alias since
-				 * the vmap restriction; nothing here
-				 * reads them through the cache, so there is
-				 * no stale line to discard. Owned-but-
-				 * unaliased is a no-op success.
+				/* As in aipu_mm_cache_flush above.
+				 * Invalidate-only is what a host about to
+				 * read NPU-written data wants, and it is the
+				 * cheaper half; it discards any dirty line,
+				 * which for these pages means the allocator's
+				 * zeroing if a job overwrote it first -- the
+				 * caller asking for this ioctl is asking for
+				 * the device's bytes. Owned is a success
+				 * either way.
 				 */
-				if (block->va)
-					aipu_cache_invalidate(mm, block->va, block->size);
-				return 0;
+				return aipu_mm_v3_block_invalidate(mm, block,
+								   iova - block->iova_start,
+								   buf->bytes);
 			}
 		}
 		dev_dbg(mm->dev, "V3: cache_invalid no owned block for pa 0x%llx\n", buf->pa);
@@ -1369,28 +1481,17 @@ int aipu_mm_mmap_buf(struct aipu_memory_manager *mm, struct vm_area_struct *vma,
 char *aipu_mm_get_va(struct aipu_memory_manager *mm, u64 dev_pa)
 {
 	struct aipu_mem_region *reg = NULL;
-	struct aipu_phy_block *block;
-	u64 iova;
-	u32 asid = 0;  /* TODO: need to pass asid or determine from context */
+	char *va;
 
 	if (!mm)
 		return NULL;
 
 	/* V3 custom IOVA path */
-	if (mm->version == AIPU_ISA_VERSION_ZHOUYI_V3 && 
+	if (mm->version == AIPU_ISA_VERSION_ZHOUYI_V3 &&
 	    mm->has_iommu && mm->use_v3_custom_iova) {
-		/* Try each ASID to find the buffer */
-		for (asid = 0; asid < ZHOUYI_ASID_COUNT; asid++) {
-			iova = aipu_mm_v3_pa_to_iova(mm, dev_pa, asid);
-			if (!iova)
-				continue;
-			
-			block = aipu_mm_v3_find_block_by_iova(mm, iova, asid);
-			if (block && block->va) {
-				/* Calculate offset within block */
-				return block->va + (iova - block->iova_start);
-			}
-		}
+		va = aipu_mm_v3_kva_by_pa(mm, dev_pa);
+		if (va)
+			return va;
 		dev_dbg(mm->dev, "V3: get_va failed for pa 0x%llx\n", dev_pa);
 		return NULL;
 	}
@@ -1414,12 +1515,9 @@ struct aipu_tcb *aipu_mm_get_tcb(struct aipu_memory_manager *mm, u64 pa)
 {
 	struct aipu_mem_region *reg = NULL;
 	struct aipu_tcb_buf *tbuf = NULL;
-	struct aipu_phy_block *block = NULL;
 	unsigned long flags;
 	struct aipu_tcb *tcb = NULL;
 	char *va = NULL;
-	u64 iova;
-	u32 asid;
 
 	if (!mm)
 		return NULL;
@@ -1427,17 +1525,9 @@ struct aipu_tcb *aipu_mm_get_tcb(struct aipu_memory_manager *mm, u64 pa)
 	/* V3 custom IOVA: pa is NPU view, need to convert to IOVA and find block */
 	if (mm->version == AIPU_ISA_VERSION_ZHOUYI_V3 &&
 	    mm->has_iommu && mm->use_v3_custom_iova) {
-		for (asid = 0; asid < ZHOUYI_ASID_COUNT; asid++) {
-			iova = aipu_mm_v3_pa_to_iova(mm, pa, asid);
-			if (!iova)
-				continue;
-
-			block = aipu_mm_v3_find_block_by_iova(mm, iova, asid);
-			if (block && block->va) {
-				va = block->va + (iova - block->iova_start);
-				return (struct aipu_tcb *)va;
-			}
-		}
+		va = aipu_mm_v3_kva_by_pa(mm, pa);
+		if (va)
+			return (struct aipu_tcb *)va;
 		dev_err(mm->dev, "[get_tcb] V3: no TCB buffer at pa 0x%llx\n", pa);
 		return NULL;
 	}
@@ -1756,6 +1846,21 @@ static void arm64_flush_cache_range_nb(void *vaddr, size_t size)
 	}
 }
 
+static void arm64_invalidate_cache_range_nb(void *vaddr, size_t size)
+{
+	unsigned long start = (unsigned long)vaddr;
+	unsigned long end = start + size;
+	unsigned long cache_line_size = get_cache_line_size();
+	unsigned long addr;
+
+	start &= ~(cache_line_size - 1);
+	end = (end + cache_line_size - 1) & ~(cache_line_size - 1);
+
+	for (addr = start; addr < end; addr += cache_line_size) {
+		asm volatile("dc ivac, %0" : : "r" (addr) : "memory");
+	}
+}
+
 static void arm64_flush_cache_range(void *vaddr, size_t size)
 {
 	arm64_flush_cache_range_nb(vaddr, size);
@@ -1874,24 +1979,28 @@ static int init_cache_ops(struct aipu_memory_manager *mm)
 	cache_ops->invalidate_range = arm64_invalidate_cache_range;
 	cache_ops->flush_range_nb = arm64_flush_cache_range_nb;
 	cache_ops->flush_barrier = arm64_cache_barrier;
+	aipu_invalidate_range_nb = arm64_invalidate_cache_range_nb;
 #elif defined(CONFIG_ARM)
 	cache_ops->flush_range = arm_flush_cache_range;
 	cache_ops->clean_range = arm_clean_cache_range;
 	cache_ops->invalidate_range = arm_invalidate_cache_range;
 	cache_ops->flush_range_nb = NULL;
 	cache_ops->flush_barrier = NULL;
+	aipu_invalidate_range_nb = NULL;
 #elif defined(CONFIG_X86_64)
 	cache_ops->flush_range = x86_flush_cache_range;
 	cache_ops->clean_range = x86_clean_cache_range;
 	cache_ops->invalidate_range = x86_invalidate_cache_range;
 	cache_ops->flush_range_nb = NULL;
 	cache_ops->flush_barrier = NULL;
+	aipu_invalidate_range_nb = NULL;
 #elif defined(CONFIG_RISCV)
 	cache_ops->flush_range = riscv_flush_cache_range;
 	cache_ops->clean_range = riscv_clean_cache_range;
 	cache_ops->invalidate_range = riscv_invalidate_cache_range;
 	cache_ops->flush_range_nb = NULL;
 	cache_ops->flush_barrier = NULL;
+	aipu_invalidate_range_nb = NULL;
 #else
 	#error "Unsupported architecture"
 #endif
@@ -2467,7 +2576,10 @@ int aipu_alloc_dma_iova_phy(struct aipu_memory_manager *mm, struct aipu_buf_requ
 			aipu_free_phy_block(mm, block);
 			goto OUT;
 		}
-		aipu_cache_invalidate(mm, block->va, block->size);
+		/* the LINEAR alias: block->va is pgprot_noncached,
+		 * so this was a no-op exactly as the BUF_CACHE ioctls were.
+		 */
+		aipu_mm_v3_block_invalidate(mm, block, 0, block->size);
 		break;
 
 	case AIPU_DMA_BUF_MALLOC_IOVA_PHY:
@@ -2491,7 +2603,8 @@ int aipu_alloc_dma_iova_phy(struct aipu_memory_manager *mm, struct aipu_buf_requ
 			dev_err(mm->dev, "Map block iova 0x%llx size 0x%llx FAILED.\n", block->iova_start, block->size);
 			goto err_free_phy;
 		}
-		aipu_cache_invalidate(mm, block->va, block->size);
+		/* the LINEAR alias, as above. */
+		aipu_mm_v3_block_invalidate(mm, block, 0, block->size);
 		break;
 
 	default:
@@ -2654,25 +2767,43 @@ int aipu_free_dma_iova_phy(struct aipu_memory_manager *mm, struct aipu_buf_desc 
 	struct aipu_phy_block *block, *tmp;
 	bool free_iova = true;
 	u64 iova;
+	u32 asid;
 
 	if (!desc || !mm)
 		return -EINVAL;
 
 	/* V3 custom IOVA path */
-	if (mm->version == AIPU_ISA_VERSION_ZHOUYI_V3 && 
+	if (mm->version == AIPU_ISA_VERSION_ZHOUYI_V3 &&
 	    mm->has_iommu && mm->use_v3_custom_iova) {
-		/* Convert PA to IOVA */
-		iova = aipu_mm_v3_pa_to_iova(mm, desc->pa, desc->asid);
-		if (!iova) {
-			dev_err(mm->dev, "V3: invalid PA 0x%llx for ASID %d\n", desc->pa, desc->asid);
-			return -EINVAL;
+		/*
+		 * Work out the ASID window instead of asking the caller which
+		 * one to look in. Nothing in the frozen UAPI obliges a free to
+		 * populate desc->asid -- every aipu_buf_desc field is marked
+		 * [kmd] -- and the vendor userspace does not: its free path
+		 * writes pa, bytes and exec_id only, leaving asid as whatever
+		 * was on the heap. One observed run left 166 there and every
+		 * buffer it freed took -EINVAL.
+		 *
+		 * The sweep is the shape aipu_mm_mmap_buf, aipu_mm_cache_flush
+		 * and aipu_mm_cache_invalid already use, and it is safe for the
+		 * same reason they are: a PA that happens to translate in more
+		 * than one window still has to resolve to a buffer THIS fd owns
+		 * before anything is freed. Without that check sweeping
+		 * would widen the set of buffers a PA can name, so this fix
+		 * depends on that ownership check, which the vendor driver lacks.
+		 */
+		for (asid = 0; asid < ZHOUYI_ASID_COUNT; asid++) {
+			iova = aipu_mm_v3_pa_to_iova(mm, desc->pa, asid);
+			if (!iova)
+				continue;
+
+			buffer = aipu_mm_v3_find_owned_buffer_by_iova(mm, iova, filp);
+			if (buffer)
+				break;
 		}
-		
-		// Find and free buffer -- only if this fd owns it
-		buffer = aipu_mm_v3_find_owned_buffer_by_iova(mm, iova, filp);
 		if (!buffer) {
-			dev_err(mm->dev, "V3: no owned buffer for IOVA 0x%llx (PA 0x%llx, ASID %d)\n",
-				iova, desc->pa, desc->asid);
+			dev_err(mm->dev, "V3: no owned buffer for PA 0x%llx in any ASID window\n",
+				desc->pa);
 			return -EINVAL;
 		}
 
@@ -2824,7 +2955,8 @@ int aipu_rebind_dma_iova_phy(struct aipu_memory_manager *mm, struct aipu_rebind_
 	}
 
 	desc->pa = block->iova_start;
-	aipu_cache_invalidate(mm, block->va, block->size);
+	/* the LINEAR alias, as in aipu_alloc_dma_buf. */
+	aipu_mm_v3_block_invalidate(mm, block, 0, block->size);
 
 OUT:
 	return ret;
@@ -3241,20 +3373,7 @@ err_unreserve:
 static void aipu_mm_v3_flush_block_pages_nb(struct aipu_memory_manager *mm,
 					    struct aipu_phy_block *block)
 {
-	void (*flush)(void *, size_t) = mm->cache_ops.flush_range_nb ?
-					mm->cache_ops.flush_range_nb :
-					mm->cache_ops.flush_range;
-	int i;
-
-	if (!flush)
-		return;
-
-	for (i = 0; i < block->page_count; i++) {
-		void *kaddr = page_address(block->pages[i]);
-
-		if (kaddr)
-			flush(kaddr, PAGE_SIZE);
-	}
+	aipu_mm_v3_block_pages_cmo_nb(mm, block, 0, block->size, false);
 }
 
 /**
@@ -3344,37 +3463,26 @@ int aipu_mm_v3_alloc_phy_and_map(struct aipu_memory_manager *mm,
 	block->iova_start = iova_addr;
 	block->dma_addr = iova_addr;
 
-	/* Map a kernel alias only for the classes that read block->va:
-	 * TCB buffers (the TCB accessors, and aipu_mm_link_tcb dereferences
-	 * kva under mm->shlock) and dma-buf exports (priv->va feeds the
-	 * dma_buf vmap hook and aipu_alloc_dma_buf fails without it). Every
-	 * other class -- text, weights, feature maps -- paid vmalloc space
-	 * and kernel PTEs for an alias nothing reads: ~0.5 GB per live graph,
-	 * measured. A va-less block degrades the cache
-	 * ioctls to a no-op success (the user mapping is Normal-NC, so there
-	 * is no dirty line to maintain) and real-time printk logs and skips
-	 * a print buffer it cannot reach.
+	/* No kernel alias is created here, for any class. We measured what
+	 * an unconditional vmap costs -- ~0.5 GB of vmalloc space and ~127k
+	 * kernel PTEs per live graph on a 96 MB working set, plus a
+	 * vmalloc-range TLB flush per free -- and the saving is kept,
+	 * but the decision no longer comes from buf_req->data_type. That field
+	 * is the caller's, the interface obliges it to be populated and
+	 * nowhere obliges it to be accurate about how the buffer will be used,
+	 * and such a claim must not decide a guarantee the
+	 * vendor gives unconditionally (the vendor vmaps every block here).
+	 *
+	 * Instead the alias is created on demand, by aipu_mm_v3_block_kva(),
+	 * when something in the kernel first resolves an address inside the
+	 * block -- so the set of aliased blocks is decided by what the kernel
+	 * does, not by what the caller said. A block nobody reads still costs
+	 * nothing.
+	 *
+	 * There is consequently nothing after the IOMMU mapping above that can
+	 * fail, which is why this function has no err_iommu_unmap label: the
+	 * vmap was the only such step, and its failure handling moved with it.
 	 */
-	if (buf_req->data_type == AIPU_MM_DATA_TYPE_TCB ||
-	    buf_req->data_type == AIPU_MM_DATA_TYPE_KMD_DMA_BUF) {
-		block->va = vmap(block->pages, page_count, VM_MAP,
-				 pgprot_noncached(PAGE_KERNEL));
-		if (!block->va) {
-			/* vmap failure must propagate as -ENOMEM.
-			 * If a hold-TCB-class buffer ends up with kva == NULL,
-			 * a subsequent aipu_mm_link_tcb dereferences kva under
-			 * mm->shlock and OOPSes the kernel with a spinlock
-			 * held. Unwind the IOMMU map, SG table, pages, and
-			 * block, then return -ENOMEM so the caller's existing
-			 * rollback runs.
-			 */
-			dev_err(mm->dev,
-				"V3: vmap failed for IOVA 0x%llx size 0x%llx\n",
-				iova_addr, block->size);
-			ret = -ENOMEM;
-			goto err_iommu_unmap;
-		}
-	}
 
 	/* Add block to buffer */
 	mutex_lock(&buffer->phy_mutex);
@@ -3402,8 +3510,6 @@ int aipu_mm_v3_alloc_phy_and_map(struct aipu_memory_manager *mm,
 
 	return 0;
 
-err_iommu_unmap:
-	iommu_unmap(mm->iommu_domain, iova_addr, block->size);
 err_free_sg:
 	sg_free_table(&block->sgt);
 err_free_pages:
@@ -3411,6 +3517,146 @@ err_free_pages:
 err_free_block:
 	kfree(block);
 	return ret;
+}
+
+/**
+ * aipu_mm_v3_block_kva - the block's kernel alias, created if it has none yet
+ * @mm:    memory manager
+ * @block: the block to alias
+ *
+ * Replaces the buf_req->data_type gate that used to decide this at allocation
+ * time. Nothing a
+ * caller wrote in its allocation request takes part; the block is aliased if
+ * and only if the kernel dereferences it.
+ *
+ * Context: MAY SLEEP -- vmap does. Callers must hold buffer->phy_mutex for the
+ * buffer owning @block, which is what keeps the block alive across the mapping
+ * and serializes two first-touchers; aipu_mm_v3_kva_by_pa() is the only caller
+ * and holds it.
+ *
+ * Concurrency with the plain readers of block->va elsewhere in this file (the
+ * cache ioctls, the teardown paths): block->va transitions NULL -> address
+ * exactly once in a block's life and never back, and the store below is a
+ * release, so an unlocked reader either sees NULL or sees a fully established
+ * mapping. A doubled load cannot see two different non-NULL values, which is
+ * why `if (block->va) ... block->va` stays correct where it already stood.
+ *
+ * Failure is reported as NULL -- the same word the callers already handle, all
+ * of which turn it into -EFAULT -- rather than as the -ENOMEM the allocation
+ * gate raised. An earlier hazard survives the move -- a hold-TCB block
+ * reaching aipu_mm_link_tcb with a NULL kva and being dereferenced under
+ * mm->shlock. That is still impossible, and now by two independent guards --
+ * aipu_mm_hold_tcb_buf_alloc fails the allocation outright if aipu_mm_get_tcb
+ * returns NULL, so htbuf->hold_tcb is never set from a failed mapping, and
+ * aipu_mm_link_tcb NULL-checks htbuf->hold_tcb under the lock before touching
+ * it.
+ *
+ * Return: the block's kernel virtual address, or NULL if it cannot be mapped.
+ */
+static void *aipu_mm_v3_block_kva(struct aipu_memory_manager *mm,
+				  struct aipu_phy_block *block)
+{
+	void *va;
+
+	if (!mm || !block || !block->pages || !block->page_count)
+		return NULL;
+
+	if (block->va)
+		return block->va;
+
+	va = vmap(block->pages, block->page_count, VM_MAP,
+		  pgprot_noncached(PAGE_KERNEL));
+	if (!va) {
+		dev_err(mm->dev, "V3: vmap failed for IOVA 0x%llx size 0x%llx\n",
+			block->iova_start, block->size);
+		return NULL;
+	}
+
+	smp_store_release(&block->va, va);
+	return va;
+}
+
+/**
+ * aipu_mm_v3_kva_by_pa - resolve a device PA to a kernel address, mapping on demand
+ * @mm:     memory manager
+ * @dev_pa: device physical address as returned by aipu_mm_alloc()
+ *
+ * Sweeps the ASID windows for one that translates @dev_pa, walks to the block
+ * holding the translated IOVA, and returns a kernel address for it -- creating
+ * the block's alias if this is the first time anything has asked.
+ *
+ * The sweep is bounded by ZHOUYI_ASID_COUNT and cannot be ambiguous: the
+ * windows are disjoint (asid_base = asid * 4 GB, window 3 GB), so at most one
+ * translates a given PA and the rest return 0.
+ *
+ * This walks mm->buffer_list itself rather than calling
+ * aipu_mm_v3_find_block_by_iova, and the difference is the point:
+ * that function returns a block with both mutexes already dropped, which is
+ * sound for a caller that only reads block->va but not for one that WRITES it.
+ * Mapping has to happen while the block is still held, or a concurrent teardown
+ * (aipu_mm_v3_destroy_buffer_now, which vunmaps and kfrees under phy_mutex)
+ * could free the block between the lookup and the store -- and unlike the
+ * pre-existing read-after-unlock, that would be a write into freed memory and a
+ * leaked mapping.
+ *
+ * Context: MAY SLEEP, and takes mm->buffer_mutex then buffer->phy_mutex -- the
+ * same two, in the same order, that aipu_mm_v3_find_block_by_iova always took
+ * here, so no caller acquires a requirement it did not have.
+ * ⚠️ One caller does not satisfy that and did not before either: print_core_id()
+ * is reached from aipu_job_manager_irq_bottom_half() under
+ * spin_lock_irqsave(&manager->lock). It is #ifdef DEBUG, so it is not built; it
+ * already slept on these mutexes; it now also reclaims through vmap. Whoever
+ * enables DEBUG must move that call out of the lock first.
+ *
+ * Return: a kernel address for @dev_pa, or NULL if it resolves to nothing or
+ * cannot be mapped.
+ */
+static char *aipu_mm_v3_kva_by_pa(struct aipu_memory_manager *mm, u64 dev_pa)
+{
+	struct aipu_iova_buffer *buffer;
+	struct aipu_phy_block *block;
+	char *va = NULL;
+	u64 iova = 0;
+	u32 asid;
+
+	if (!mm || !mm->use_v3_custom_iova)
+		return NULL;
+
+	mutex_lock(&mm->buffer_mutex);
+	for (asid = 0; asid < ZHOUYI_ASID_COUNT; asid++) {
+		iova = aipu_mm_v3_pa_to_iova(mm, dev_pa, asid);
+		if (!iova)
+			continue;
+
+		list_for_each_entry(buffer, &mm->buffer_list, node) {
+			void *kva;
+
+			if (buffer->asid != asid)
+				continue;
+			if (iova < buffer->iova_start ||
+			    iova >= buffer->iova_start + buffer->iova_size)
+				continue;
+
+			mutex_lock(&buffer->phy_mutex);
+			list_for_each_entry(block, &buffer->phy_blocks, list) {
+				if (iova < block->iova_start ||
+				    iova >= block->iova_start + block->size)
+					continue;
+
+				kva = aipu_mm_v3_block_kva(mm, block);
+				if (kva)
+					va = (char *)kva + (iova - block->iova_start);
+				break;
+			}
+			mutex_unlock(&buffer->phy_mutex);
+			if (va)
+				goto out;
+		}
+	}
+out:
+	mutex_unlock(&mm->buffer_mutex);
+
+	return va;
 }
 
 /**

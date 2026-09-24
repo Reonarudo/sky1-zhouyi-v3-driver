@@ -41,6 +41,11 @@ struct aipu_priv;
  * @disable_tick_counter: disable the tick counter
  * @enable_tick_counter:  enable the tick counter
  * @enable_core_cnt:      enable cores (the number is core_cnt) in a cluster (v3 only)
+ * @is_pool_idle:         is this partition's command pool drained -- nothing
+ *                        queued or executing on either QoS chain (v3 only).
+ *                        The one piece of hardware evidence the completion
+ *                        path has that a job whose own interrupt it never saw
+ *                        is finished rather than still running.
  */
 struct aipu_operations {
 	int (*get_config)(struct aipu_partition *aipu);
@@ -68,6 +73,7 @@ struct aipu_operations {
 	void (*disable_tick_counter)(struct aipu_partition *partition);
 	void (*enable_tick_counter)(struct aipu_partition *partition);
 	void (*enable_core_cnt)(struct aipu_partition *partition, u32 cluster_id, u32 core_cnt);
+	bool (*is_pool_idle)(struct aipu_partition *partition);
 };
 
 /**

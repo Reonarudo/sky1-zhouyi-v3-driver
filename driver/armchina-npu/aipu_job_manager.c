@@ -483,6 +483,21 @@ static int schedule_v3_job_no_lock(struct aipu_job_manager *manager, struct aipu
 
 	ret = partition->ops->reserve(partition, &job->desc, trigger_type, 0);
 	if (!ret) {
+		/*
+		 * tripwire for the one window retire-on-drain
+		 * cannot close by reading: the pool must be BUSY from the
+		 * dispatch write onward, or an interrupt landing between this
+		 * dispatch and the TSM's first fetch would read the pool idle
+		 * and retire this job before it ran. Read here, under the
+		 * same manager->lock the IRQ upper half takes, so the read is
+		 * earlier than any handler could be. Silence over a session's
+		 * dispatches is the measurement that the window is closed.
+		 */
+		if (partition->ops->is_pool_idle && partition->ops->is_pool_idle(partition))
+			dev_warn_ratelimited(partition->dev,
+				"job 0x%llx: command pool reads IDLE right after its dispatch (retire-on-drain window)\n",
+				job->desc.job_id);
+
 		if (trigger_type == ZHOUYI_TRIGGER_TYPE_CREATE ||
 		    trigger_type == ZHOUYI_TRIGGER_TYPE_DEBUG_DISPATCH)
 			pool->created = true;
@@ -515,6 +530,9 @@ MODULE_PARM_DESC(job_deadline_s,
 
 #define AIPU_JOB_DEADLINE_SWEEP_MS 5000
 
+static bool retire_drained_pool_no_lock(struct aipu_job_manager *manager,
+					struct aipu_partition *partition);
+
 /*
  * Periodic self-rescheduling sweep, armed at dispatch, lapsing when no job is
  * left running/deferred. No per-job timer: coarse expiry (deadline + period)
@@ -533,10 +551,21 @@ static void aipu_job_manager_deadline_sweep(struct work_struct *work)
 	ktime_t now = ktime_get();
 	bool outstanding = false;
 	bool expired = false;
+	bool retired = false;
 	unsigned long flags;
 	int id = 0;
 
 	spin_lock_irqsave(&manager->lock, flags);
+	/*
+	 * evidence before expiry: a RUNNING job in a pool that
+	 * has drained is finished, not wedged. Bounds a job whose completion
+	 * went unreported to one sweep period, retired as the SUCCESS it is,
+	 * instead of the deadline, reported as the exception it is not.
+	 */
+	if (manager->version == AIPU_ISA_VERSION_ZHOUYI_V3 && manager->partitions) {
+		for (id = 0; id < manager->partition_cnt; id++)
+			retired |= retire_drained_pool_no_lock(manager, &manager->partitions[id]);
+	}
 	list_for_each_entry(curr, &manager->scheduled_head->node, node) {
 		if (curr->state != AIPU_JOB_STATE_RUNNING &&
 		    curr->state != AIPU_JOB_STATE_DEFERRED)
@@ -564,7 +593,7 @@ static void aipu_job_manager_deadline_sweep(struct work_struct *work)
 	spin_unlock_irqrestore(&manager->lock, flags);
 
 	/* retire like the completion path: EXCEP -> bottom half -> wake-up */
-	if (expired && manager->partitions) {
+	if ((expired || retired) && manager->partitions) {
 		for (id = 0; id < manager->partition_cnt; id++)
 			aipu_job_manager_irq_bottom_half(&manager->partitions[id]);
 	}
@@ -1102,6 +1131,80 @@ static bool is_job_abnormal(struct aipu_job *job, int flag,
 }
 
 /*
+ * retire on EVIDENCE the RUNNING jobs whose own
+ * completion interrupt this partition never saw.
+ *
+ * The hardware raises one DONE interrupt per completing TCB and reports one
+ * TCB pointer; two completions inside the handler's window leave one of them
+ * unreported. Vendor 6.2.0 (and this driver, until this change) covered that case by
+ * marking every EARLIER-scheduled RUNNING job of the same pool and QoS class
+ * SUCCESS whenever a later one completed, on the stated assumption that list
+ * order is completion order. It is, for a chain: the TSM starts the next grid
+ * when the previous one ends. It is not for a wave: consecutive groups of ONE
+ * grid are dispatched to different cores and run in parallel, and whichever
+ * finishes first retired the others underneath themselves -- a job reported
+ * DONE while its tasks were still executing, its buffers harvested and freed
+ * under a live walk, its hold TCB unlinked mid-chain (the aipu_mm_unlink_tcb
+ * Oops from three callers). Measured at 30 of 40 waves at the cheapest
+ * working set, 30 of 300 at the dearest, and 0 of 380 once the two chains
+ * could no longer be paired.
+ *
+ * The assumption is replaced by the pool's own idle bit: nothing queued or
+ * executing on either chain. A RUNNING job in a drained pool is finished, so
+ * it is retired; in a busy pool it is left alone, and its own interrupt --
+ * or the next one that finds the pool drained, which the job's hold TCB
+ * raises after its last task -- retires it. Order in the list no longer
+ * decides anything, so later-scheduled jobs are covered too.
+ *
+ * Cost: the register is read at most once per call, and only when a RUNNING
+ * job other than the one matched exists -- the lone-job inference path never
+ * reads it. The upper-half completion wake is untouched.
+ *
+ * Runs under manager->lock. Returns true if it retired anything, so a caller
+ * outside the interrupt path (the deadline sweep) knows to run the bottom
+ * half and wake the pollers.
+ */
+static bool retire_drained_pool_no_lock(struct aipu_job_manager *manager,
+					struct aipu_partition *partition)
+{
+	struct aipu_job *curr = NULL;
+	bool retired = false;
+	int idle = -1;	/* not read yet */
+
+	if (!partition->ops->is_pool_idle)
+		return false;
+
+	list_for_each_entry(curr, &manager->scheduled_head->node, node) {
+		if (curr->state != AIPU_JOB_STATE_RUNNING ||
+		    curr->desc.partition_id != partition->id ||
+		    (curr->desc.aipu_version != AIPU_ISA_VERSION_ZHOUYI_V3 &&
+		     curr->desc.aipu_version < AIPU_ISA_VERSION_ZHOUYI_V3_2))
+			continue;
+
+		if (idle < 0)
+			idle = partition->ops->is_pool_idle(partition);
+		if (!idle)
+			return false;
+
+		curr->state = AIPU_JOB_STATE_SUCCESS;
+		if (curr->desc.exec_flag & AIPU_JOB_EXEC_FLAG_SRAM_MUTEX)
+			manager->exec_flag &= ~AIPU_JOB_EXEC_FLAG_SRAM_MUTEX;
+		retired = true;
+		/*
+		 * Kept visible: how often a completion goes unreported is a
+		 * property of the part nobody has measured, and this line is
+		 * the instrument. Profiling stamps (done_time, tick_counter)
+		 * are not available for a job retired this way.
+		 */
+		dev_info_ratelimited(partition->dev,
+			"job 0x%llx retired on pool drain: its own completion interrupt was not seen\n",
+			curr->desc.job_id);
+	}
+
+	return retired;
+}
+
+/*
  * retire completed jobs -- profiling stamp, hold-TCB unlink,
  * poller wake -- in the upper half, exactly as the bottom half would (its
  * two loops skip anything retired here via !wake_up). The wake used to
@@ -1231,48 +1334,19 @@ void aipu_job_manager_irq_upper_half(struct aipu_partition *partition, int flag,
 			if (manager->pools && manager->pools[partition->id].debug)
 				manager->dbg_do_destroy = true;
 
-				/*
-				 * For v3/v3_2: the hardware fires one done interrupt
-				 * per command pool execution, reporting only the last
-				 * completed TCB. When multiple jobs from different
-				 * processes are chained in the same command pool,
-				 * preceding RUNNING jobs whose TCBs finished before
-				 * the matched job also need to be marked SUCCESS.
-				 *
-				 * Assumptions:
-				 * - scheduled_head list order matches the hardware
-				 *   hold-TCB chain order (both follow schedule order).
-				 * - partition_id plus QoS class scope the chain: V3
-				 *   keeps two independent hardware chains per pool
-				 *   (qlist[SLOW]/qlist[FAST]) that progress and
-				 *   complete separately, so a completion on one chain
-				 *   must not retire preceding jobs on the other -- they
-				 *   may still be executing.
-				 * - Profiling data (done_time, tick_counter) is not
-				 *   collected for these preceding jobs. Jobs that
-				 *   require enable_prof should run without competing
-				 *   jobs on the same command pool.
-				 */
-			if (curr->desc.aipu_version == AIPU_ISA_VERSION_ZHOUYI_V3 ||
-			    curr->desc.aipu_version >= AIPU_ISA_VERSION_ZHOUYI_V3_2) {
-				struct aipu_job *prev = NULL;
-				list_for_each_entry(prev, &manager->scheduled_head->node, node) {
-					if (prev == curr)
-						break;
-					if (prev->state == AIPU_JOB_STATE_RUNNING &&
-					    prev->desc.partition_id == curr->desc.partition_id &&
-					    (prev->desc.exec_flag & AIPU_JOB_EXEC_FLAG_QOS_SLOW) ==
-					    (curr->desc.exec_flag & AIPU_JOB_EXEC_FLAG_QOS_SLOW)) {
-						prev->state = AIPU_JOB_STATE_SUCCESS;
-						if (prev->desc.exec_flag & AIPU_JOB_EXEC_FLAG_SRAM_MUTEX)
-							manager->exec_flag &= ~AIPU_JOB_EXEC_FLAG_SRAM_MUTEX;
-					}
-				}
-			}
-
 			break;
 		}
 	}
+
+	/*
+	 * the jobs this interrupt did NOT name. The vendor's
+	 * "retire every earlier RUNNING job of the same chain" loop stood
+	 * here; it is replaced by evidence, and runs whether or not a job
+	 * matched above -- the interrupt that finds the pool drained is
+	 * usually the hold TCB's, which names no job at all.
+	 */
+	if (manager->version == AIPU_ISA_VERSION_ZHOUYI_V3)
+		retire_drained_pool_no_lock(manager, partition);
 
 	if (!atomic_read(&partition->disable)) {
 		list_for_each_entry(curr, &manager->scheduled_head->node, node) {
@@ -1600,17 +1674,18 @@ int aipu_job_manager_get_job_status(struct aipu_job_manager *manager,
 	spin_unlock_irqrestore(&manager->lock, flags);
 
 	/*
-	 * No cache maintenance on harvest. Every alias of
-	 * NPU-written memory is uncached: user mappings are Normal-NC
-	 * (aipu_mm_mmap_buf), the kernel vmap alias is pgprot_noncached,
-	 * and the linear map is only ever CPU-written at allocation time,
-	 * where alloc_phy_and_map clean+invalidates each block. Post-alloc
-	 * the linear map can hold only clean speculative lines, whose
-	 * eviction is architecturally silent -- so the whole-fd
-	 * clean+invalidate walk that lived here (O(live REUSE+STACK bytes)
-	 * under buffer_mutex, once per completion: 12% of a small-graph
-	 * inference, 8.5 ms of a VAE decode) maintained lines no reader
-	 * ever consumed.
+	 * No cache maintenance on harvest: the whole-fd
+	 * clean+invalidate walk that lived here cost O(live REUSE+STACK bytes)
+	 * under buffer_mutex once per completion -- 12% of a small-graph
+	 * inference, 8.5 ms of a VAE decode.
+	 *
+	 * ⚠️ It is not free of consequence, and the comment here
+	 * used to say it was. A host read of NPU-written memory is served a
+	 * stale CLEAN line from the pages' linear alias until something
+	 * invalidates it. The reader pays
+	 * for what it reads instead: AIPU_IOCTL_BUF_CACHE_INVALID, 0.1 ms per
+	 * 2 MB. Reinstating a blanket walk here would buy the same visibility
+	 * at the whole fd's price.
 	 */
 
 	/*

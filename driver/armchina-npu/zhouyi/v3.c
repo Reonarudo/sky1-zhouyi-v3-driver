@@ -281,6 +281,21 @@ static bool zhouyi_v3_is_idle(struct aipu_partition *partition)
 	return !IS_CMD_POOL_FULL(status);
 }
 
+/*
+ * the command pool's own idle bit (A1.1.12 [6]): set
+ * when nothing is queued or executing in the pool, on either QoS chain.
+ * Distinct from is_idle above, which asks the TSM whether the pool can take
+ * another command. This is the evidence the job manager's completion path
+ * retires an unmatched RUNNING job on; one read, only when such a job exists.
+ */
+static bool zhouyi_v3_is_pool_idle(struct aipu_partition *partition)
+{
+	u32 status = 0;
+
+	aipu_read32(partition->reg, CMD_POOL_STATUS_REG(partition->id), &status);
+	return IS_CMD_POOL_IDLE(status);
+}
+
 static void zhouyi_v3_print_hw_id_info(struct aipu_partition *partition)
 {
 	struct aipu_priv *aipu = partition->priv;
@@ -323,11 +338,18 @@ static int zhouyi_v3_io_rw(struct aipu_partition *partition, struct aipu_io_req 
 		return -EINVAL;
 
 	/*
-	 * nothing ever read reg_type: a caller asking for the
-	 * debug window silently got the host window at the same offset.
-	 * No debug window exists (the never-populated dbg_reg
-	 * fields were deleted as dead weight), so refuse rather than
-	 * pretend.
+	 * Only the host register window exists on this part. The vendor's
+	 * zhouyi_v3_io_rw ignores reg_type, so a caller asking for the debug
+	 * window (AIPU_DBG_REG) silently got a host-register access at the same
+	 * offset -- a debug-register write became a live host-register write,
+	 * from a 0666 node, with no diagnostic. Refuse it instead: -EINVAL tells
+	 * the caller that no debug window exists.
+	 *
+	 * A caller that zeroes its request asks for AIPU_HOST_REG (0) and is
+	 * served; the vendor UMD sets reg_type on every REQ_IO. An in-kernel
+	 * builder of a struct aipu_io_req must name every field, as
+	 * aipu_common_ext_register_sysfs_store() does. partition_id is bounded
+	 * against partition_cnt in aipu_priv_io_rw().
 	 */
 	if (io_req->reg_type != AIPU_HOST_REG)
 		return -EINVAL;
@@ -549,6 +571,7 @@ static struct aipu_operations zhouyi_v3_ops = {
 	.disable_tick_counter = zhouyi_v3_disable_tick_counter,
 	.enable_tick_counter = zhouyi_v3_enable_tick_counter,
 	.enable_core_cnt = zhouyi_v3_enable_core_cnt,
+	.is_pool_idle = zhouyi_v3_is_pool_idle,
 };
 
 struct aipu_operations *get_zhouyi_v3_ops(void)
