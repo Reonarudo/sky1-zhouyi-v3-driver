@@ -2,6 +2,7 @@
 /* Copyright (c) 2023-2025 Arm Technology (China) Co. Ltd. */
 
 #include <linux/types.h>
+#include <linux/moduleparam.h>
 #include <asm/cacheflush.h>
 #include <linux/mm.h>
 #include <linux/of.h>
@@ -664,6 +665,9 @@ int aipu_init_mm(struct aipu_memory_manager *mm, struct platform_device *p_dev, 
 	if (!mm->importer_bufs)
 		return -ENOMEM;
 	INIT_LIST_HEAD(&mm->importer_bufs->node);
+	INIT_LIST_HEAD(&mm->wbufs);
+	INIT_LIST_HEAD(&mm->slots);
+	mutex_init(&mm->wslot_lock);
 	spin_lock_init(&mm->slock);
 	spin_lock_init(&mm->shlock);
 	mm->default_asid_base = 0;
@@ -1417,6 +1421,8 @@ int aipu_mm_mmap_buf(struct aipu_memory_manager *mm, struct vm_area_struct *vma,
 		return -EINVAL;
 
 	dev_pa = vma->vm_pgoff << PAGE_SHIFT;
+	if ((u64)dev_pa >= AIPU_WBUF_MMAP_BASE)		/* a zero-copy weight buffer, not an NPU-view address */
+		return aipu_wbuf_mmap(mm, vma, filp);
 
 	vm_flags_set(vma, VM_IO);
 	vma->vm_page_prot = pgprot_dmacoherent(vma->vm_page_prot);
@@ -4102,4 +4108,414 @@ void aipu_mm_v3_free_buffers_by_filp(struct aipu_memory_manager *mm,
 
 	kfree(buffers_to_free);
 	dev_dbg(mm->dev, "V3: freed %d buffers for filp\n", count);
+}
+
+
+/*
+ * Zero-copy weights (V3 custom IOVA).
+ *
+ * A model whose weights exceed the NPU's 3 GB window used to copy each layer into window buffers every
+ * token: the CPU read and wrote every weight byte, competing with the NPU for DDR. Here the weights live
+ * once in host memory (aipu_wbuf: 2 MiB chunks, outside the window, filled by the process through a
+ * write-combine mmap), and a window range (aipu_slot) is re-pointed at a layer's chunks per token: one
+ * SMMU block entry per chunk and one TLB invalidation, no data movement, no per-token cache maintenance.
+ *
+ * Ordering is the caller's: a slot must not be re-mapped while a submitted job still reads it. iommu_unmap
+ * returns after the SMMU's TLB invalidation has completed, so a job submitted after SLOT_MAP returns sees
+ * only the new mapping.
+ */
+/* Testing: every weight-buffer unit as 512 order-0 pages (the fallback when no 2 MiB block is free). */
+static bool wbuf_force_small;
+module_param(wbuf_force_small, bool, 0644);
+MODULE_PARM_DESC(wbuf_force_small, "zero-copy weight buffers: always use 4 KiB pages (tests the fallback)");
+
+static bool aipu_wslot_supported(struct aipu_memory_manager *mm)
+{
+	return mm && mm->version == AIPU_ISA_VERSION_ZHOUYI_V3 && mm->has_iommu && mm->use_v3_custom_iova;
+}
+
+static struct aipu_wbuf *aipu_wbuf_find(struct aipu_memory_manager *mm, u64 id, struct file *filp)
+{
+	struct aipu_wbuf *w;
+
+	list_for_each_entry(w, &mm->wbufs, node)
+		if (w->id == id && w->filp == filp)
+			return w;
+	return NULL;
+}
+
+static struct aipu_slot *aipu_slot_find(struct aipu_memory_manager *mm, u64 id, struct file *filp)
+{
+	struct aipu_slot *sl;
+
+	list_for_each_entry(sl, &mm->slots, node)
+		if (sl->id == id && sl->filp == filp)
+			return sl;
+	return NULL;
+}
+
+#define AIPU_WUNIT_PAGES	(AIPU_WCHUNK >> PAGE_SHIFT)
+
+static void aipu_wbuf_destroy(struct aipu_wbuf *w)
+{
+	u32 i, j;
+
+	for (i = 0; i < w->nchunks; i++) {
+		if (w->chunks[i])
+			__free_pages(w->chunks[i], get_order(AIPU_WCHUNK));
+		if (w->small && w->small[i]) {
+			for (j = 0; j < AIPU_WUNIT_PAGES; j++)
+				if (w->small[i][j])
+					__free_page(w->small[i][j]);
+			kvfree(w->small[i]);
+		}
+	}
+	kvfree(w->small);
+	kvfree(w->chunks);
+	kfree(w);
+}
+
+/* A unit of 512 order-0 pages when no 2 MiB block is available: mapped with page entries instead of one block entry. */
+static int aipu_wbuf_small_unit(struct aipu_wbuf *w, u32 i, void (*op)(void *, size_t))
+{
+	u32 j;
+
+	w->small[i] = kvcalloc(AIPU_WUNIT_PAGES, sizeof(struct page *), GFP_KERNEL);
+	if (!w->small[i])
+		return -ENOMEM;
+	for (j = 0; j < AIPU_WUNIT_PAGES; j++) {
+		w->small[i][j] = alloc_page(GFP_KERNEL | __GFP_ZERO | __GFP_NOWARN);
+		if (!w->small[i][j])
+			return -ENOMEM;
+		if (op)
+			op(page_address(w->small[i][j]), PAGE_SIZE);
+	}
+	return 0;
+}
+
+int aipu_wbuf_alloc(struct aipu_memory_manager *mm, struct aipu_wbuf_req *req, struct file *filp)
+{
+	void (*op)(void *, size_t);
+	struct aipu_wbuf *w;
+	u64 n;
+	u32 i;
+
+	if (!aipu_wslot_supported(mm))
+		return -EOPNOTSUPP;
+	if (!req->bytes)
+		return -EINVAL;
+	n = DIV_ROUND_UP(req->bytes, (u64)AIPU_WCHUNK);
+	if (n > (1ULL << (AIPU_WBUF_MMAP_SHIFT - 21)))	/* one mmap stride: 64 GiB */
+		return -EINVAL;
+
+	w = kzalloc(sizeof(*w), GFP_KERNEL);
+	if (!w)
+		return -ENOMEM;
+	w->chunks = kvcalloc(n, sizeof(*w->chunks), GFP_KERNEL);
+	w->small = kvcalloc(n, sizeof(*w->small), GFP_KERNEL);
+	if (!w->chunks || !w->small) {
+		kvfree(w->chunks);
+		kvfree(w->small);
+		kfree(w);
+		return -ENOMEM;
+	}
+	w->nchunks = n;
+	atomic_set(&w->mmaps, 0);
+
+	/*
+	 * Zeroed (nothing of the kernel's may reach the process) through the cacheable linear alias, then
+	 * cleaned+invalidated: a dirty zero line evicted later would overwrite the weights the process
+	 * writes through its non-cacheable mapping. Once per buffer, never per token.
+	 */
+	op = mm->cache_ops.flush_range_nb ? mm->cache_ops.flush_range_nb : mm->cache_ops.flush_range;
+	for (i = 0; i < n; i++) {
+		/* a 2 MiB block if one is free right now (no reclaim or compaction: those stall for long), else 512 pages */
+		w->chunks[i] = wbuf_force_small ? NULL : alloc_pages(GFP_KERNEL | __GFP_ZERO | __GFP_NOWARN | __GFP_NORETRY,
+									  get_order(AIPU_WCHUNK));
+		if (w->chunks[i]) {
+			w->nbig++;
+			if (op)
+				op(page_address(w->chunks[i]), AIPU_WCHUNK);
+		} else if (aipu_wbuf_small_unit(w, i, op)) {
+			dev_info(mm->dev, "WBUF_ALLOC: out of memory at unit %u of %llu\n", i, n);
+			aipu_wbuf_destroy(w);
+			return -ENOMEM;
+		}
+		cond_resched();
+	}
+	if (mm->cache_ops.flush_barrier)
+		mm->cache_ops.flush_barrier();
+
+	mutex_lock(&mm->wslot_lock);
+	w->id = ++mm->wslot_next_id;
+	w->filp = filp;
+	list_add_tail(&w->node, &mm->wbufs);
+	mutex_unlock(&mm->wslot_lock);
+
+	req->id = w->id;
+	req->mmap_offset = AIPU_WBUF_MMAP_BASE + (w->id << AIPU_WBUF_MMAP_SHIFT);
+	if (w->nbig < w->nchunks)
+		dev_dbg(mm->dev, "WBUF_ALLOC: %u of %u units as 2 MiB blocks, the rest 4 KiB pages\n", w->nbig, w->nchunks);
+	return 0;
+}
+
+int aipu_wbuf_free(struct aipu_memory_manager *mm, u64 id, struct file *filp)
+{
+	struct aipu_wbuf *w;
+	int ret = 0;
+
+	mutex_lock(&mm->wslot_lock);
+	w = aipu_wbuf_find(mm, id, filp);
+	if (!w)
+		ret = -EINVAL;
+	else if (w->slot_refs || atomic_read(&w->mmaps))
+		ret = -EBUSY;		/* still mapped in a slot, or into the process */
+	else
+		list_del(&w->node);
+	mutex_unlock(&mm->wslot_lock);
+	if (!ret)
+		aipu_wbuf_destroy(w);
+	return ret;
+}
+
+static void aipu_wbuf_vm_open(struct vm_area_struct *vma)
+{
+	struct aipu_wbuf *w = vma->vm_private_data;
+
+	atomic_inc(&w->mmaps);
+}
+
+static void aipu_wbuf_vm_close(struct vm_area_struct *vma)
+{
+	struct aipu_wbuf *w = vma->vm_private_data;
+
+	atomic_dec(&w->mmaps);
+}
+
+static const struct vm_operations_struct aipu_wbuf_vm_ops = {
+	.open = aipu_wbuf_vm_open,
+	.close = aipu_wbuf_vm_close,
+};
+
+int aipu_wbuf_mmap(struct aipu_memory_manager *mm, struct vm_area_struct *vma, struct file *filp)
+{
+	u64 off = (u64)vma->vm_pgoff << PAGE_SHIFT, size = vma->vm_end - vma->vm_start, done = 0;
+	struct aipu_wbuf *w;
+	int ret = 0;
+	u32 i;
+
+	if (off < AIPU_WBUF_MMAP_BASE || (off - AIPU_WBUF_MMAP_BASE) & ((1ULL << AIPU_WBUF_MMAP_SHIFT) - 1))
+		return -EINVAL;		/* a whole buffer from its start, nothing else */
+	mutex_lock(&mm->wslot_lock);
+	w = aipu_wbuf_find(mm, (off - AIPU_WBUF_MMAP_BASE) >> AIPU_WBUF_MMAP_SHIFT, filp);
+	if (!w || size > (u64)w->nchunks * AIPU_WCHUNK) {
+		mutex_unlock(&mm->wslot_lock);
+		return -EINVAL;
+	}
+	vm_flags_set(vma, VM_IO | VM_DONTEXPAND | VM_DONTDUMP);
+	vma->vm_page_prot = pgprot_dmacoherent(vma->vm_page_prot);	/* Normal-NC, as every buffer of this driver */
+	for (i = 0; done < size && !ret; i++) {
+		u64 len = min_t(u64, AIPU_WCHUNK, size - done), p;
+
+		if (w->chunks[i])
+			ret = remap_pfn_range(vma, vma->vm_start + done, page_to_pfn(w->chunks[i]), len, vma->vm_page_prot);
+		else
+			for (p = 0; p < len && !ret; p += PAGE_SIZE)
+				ret = remap_pfn_range(vma, vma->vm_start + done + p, page_to_pfn(w->small[i][p >> PAGE_SHIFT]),
+						      PAGE_SIZE, vma->vm_page_prot);
+		done += len;
+	}
+	if (!ret) {
+		vma->vm_private_data = w;
+		vma->vm_ops = &aipu_wbuf_vm_ops;
+		atomic_inc(&w->mmaps);
+	}
+	mutex_unlock(&mm->wslot_lock);
+	return ret;
+}
+
+static void aipu_slot_unmap_locked(struct aipu_memory_manager *mm, struct aipu_slot *sl)
+{
+	if (sl->mapped) {
+		size_t un = iommu_unmap(mm->iommu_domain, sl->iova_start, sl->mapped);
+
+		if (un != sl->mapped)
+			dev_warn(mm->dev, "SLOT_MAP: unmapped 0x%zx of 0x%llx at IOVA 0x%llx\n",
+				 un, sl->mapped, sl->iova_start);
+	}
+	if (sl->wbuf)
+		sl->wbuf->slot_refs--;
+	sl->mapped = 0;
+	sl->wbuf = NULL;
+}
+
+int aipu_slot_alloc(struct aipu_memory_manager *mm, struct aipu_slot_req *req, struct file *filp)
+{
+	struct aipu_asid_iova_info *ai;
+	unsigned long pfn_hi;
+	struct aipu_slot *sl;
+	u64 bytes, total;
+
+	if (!aipu_wslot_supported(mm))
+		return -EOPNOTSUPP;
+	if (!req->bytes)
+		return -EINVAL;
+	bytes = ALIGN(req->bytes, (u64)AIPU_WCHUNK);
+	total = bytes + AIPU_WCHUNK;		/* slack to align the start to a chunk */
+	ai = &mm->asid_iova[0];
+
+	spin_lock(&mm->asid_lock);
+	if (ai->iova_used + total > ai->iova_size) {
+		spin_unlock(&mm->asid_lock);
+		return -ENOMEM;
+	}
+	ai->iova_used += total;
+	spin_unlock(&mm->asid_lock);
+
+	sl = kzalloc(sizeof(*sl), GFP_KERNEL);
+	if (!sl)
+		goto err_unreserve;
+	pfn_hi = ((ai->iova_base + ai->iova_size) >> PAGE_SHIFT) - 1;
+	sl->iova = alloc_iova(&mm->iova_domain, total >> PAGE_SHIFT, pfn_hi, false);
+	if (!sl->iova || ((u64)sl->iova->pfn_lo << PAGE_SHIFT) < ai->iova_base) {
+		if (sl->iova)
+			__free_iova(&mm->iova_domain, sl->iova);
+		kfree(sl);
+		goto err_unreserve;
+	}
+	sl->iova_start = ALIGN((u64)sl->iova->pfn_lo << PAGE_SHIFT, (u64)AIPU_WCHUNK);
+	sl->bytes = bytes;
+	sl->reserved = total;
+
+	mutex_lock(&mm->wslot_lock);
+	sl->id = ++mm->wslot_next_id;
+	sl->filp = filp;
+	list_add_tail(&sl->node, &mm->slots);
+	mutex_unlock(&mm->wslot_lock);
+
+	req->id = sl->id;
+	req->pa = aipu_mm_v3_iova_to_pa(mm, sl->iova_start, 0);
+	return 0;
+
+err_unreserve:
+	spin_lock(&mm->asid_lock);
+	ai->iova_used -= total;
+	spin_unlock(&mm->asid_lock);
+	return -ENOMEM;
+}
+
+static void aipu_slot_destroy_locked(struct aipu_memory_manager *mm, struct aipu_slot *sl)
+{
+	aipu_slot_unmap_locked(mm, sl);
+	list_del(&sl->node);
+	__free_iova(&mm->iova_domain, sl->iova);
+	spin_lock(&mm->asid_lock);
+	mm->asid_iova[0].iova_used -= sl->reserved;
+	spin_unlock(&mm->asid_lock);
+	kfree(sl);
+}
+
+int aipu_slot_free(struct aipu_memory_manager *mm, u64 id, struct file *filp)
+{
+	struct aipu_slot *sl;
+	int ret = 0;
+
+	mutex_lock(&mm->wslot_lock);
+	sl = aipu_slot_find(mm, id, filp);
+	if (sl)
+		aipu_slot_destroy_locked(mm, sl);
+	else
+		ret = -EINVAL;
+	mutex_unlock(&mm->wslot_lock);
+	return ret;
+}
+
+int aipu_slot_map(struct aipu_memory_manager *mm, struct aipu_slot_map *map, struct file *filp)
+{
+	struct aipu_slot *sl;
+	struct aipu_wbuf *w = NULL;
+	u64 bytes, first, i, done;
+	int ret = 0;
+
+	if (!aipu_wslot_supported(mm))
+		return -EOPNOTSUPP;
+	bytes = ALIGN(map->bytes, (u64)AIPU_WCHUNK);
+
+	mutex_lock(&mm->wslot_lock);
+	sl = aipu_slot_find(mm, map->slot_id, filp);
+	if (!sl) {
+		ret = -EINVAL;
+		goto out;
+	}
+	if (bytes) {
+		w = aipu_wbuf_find(mm, map->wbuf_id, filp);
+		if (!w || map->offset & (AIPU_WCHUNK - 1) || bytes > sl->bytes ||
+		    map->offset + bytes > (u64)w->nchunks * AIPU_WCHUNK) {
+			ret = -EINVAL;
+			goto out;
+		}
+	}
+	aipu_slot_unmap_locked(mm, sl);		/* the old mapping and its TLB entries are gone before the new one */
+	first = map->offset / AIPU_WCHUNK;
+	done = 0;				/* bytes mapped from the slot's start, exactly (the unwind unmaps these) */
+	for (i = 0; i < bytes / AIPU_WCHUNK && !ret; i++) {
+		u64 iova = sl->iova_start + i * AIPU_WCHUNK;
+		u32 j;
+
+		if (w->chunks[first + i]) {	/* one block entry */
+			ret = iommu_map(mm->iommu_domain, iova, page_to_phys(w->chunks[first + i]), AIPU_WCHUNK,
+					IOMMU_READ | IOMMU_WRITE, GFP_KERNEL);
+			if (!ret)
+				done += AIPU_WCHUNK;
+			continue;
+		}
+		for (j = 0; j < AIPU_WUNIT_PAGES && !ret; ) {	/* 512 page entries, physically adjacent pages merged */
+			phys_addr_t pa = page_to_phys(w->small[first + i][j]);
+			u32 run = 1;
+
+			while (j + run < AIPU_WUNIT_PAGES &&
+			       page_to_phys(w->small[first + i][j + run]) == pa + ((u64)run << PAGE_SHIFT))
+				run++;
+			ret = iommu_map(mm->iommu_domain, iova + ((u64)j << PAGE_SHIFT), pa, (size_t)run << PAGE_SHIFT,
+					IOMMU_READ | IOMMU_WRITE, GFP_KERNEL);
+			if (!ret)
+				done += (u64)run << PAGE_SHIFT;
+			j += run;
+		}
+	}
+	if (ret) {
+		dev_err(mm->dev, "SLOT_MAP: iommu_map failed at IOVA 0x%llx (%d)\n", sl->iova_start + done, ret);
+		sl->mapped = done;
+		sl->wbuf = NULL;
+		aipu_slot_unmap_locked(mm, sl);
+		goto out;
+	}
+	sl->mapped = bytes;
+	if (bytes) {
+		sl->wbuf = w;
+		w->slot_refs++;
+	}
+out:
+	mutex_unlock(&mm->wslot_lock);
+	return ret;
+}
+
+/* fd close: every slot (unmapping it), then every weight buffer. mmap()s hold the file, so none is left. */
+void aipu_wslot_release(struct aipu_memory_manager *mm, struct file *filp)
+{
+	struct aipu_slot *sl, *sn;
+	struct aipu_wbuf *w, *wn;
+
+	if (!mm || !mm->slots.next)
+		return;
+	mutex_lock(&mm->wslot_lock);
+	list_for_each_entry_safe(sl, sn, &mm->slots, node)
+		if (sl->filp == filp)
+			aipu_slot_destroy_locked(mm, sl);
+	list_for_each_entry_safe(w, wn, &mm->wbufs, node)
+		if (w->filp == filp) {
+			list_del(&w->node);
+			aipu_wbuf_destroy(w);
+		}
+	mutex_unlock(&mm->wslot_lock);
 }

@@ -763,6 +763,47 @@ struct aipu_id_desc {
  */
 #define AIPU_IOCTL_FREE_SFLAG_ID _IOW(AIPU_IOCTL_MAGIC, 27, struct aipu_id_desc)
 /**
+ * struct aipu_wbuf_req - WBUF_ALLOC: host memory for weights, outside the NPU window until mapped into a slot
+ * @bytes:       [in]  size; rounded up to whole 2 MiB chunks
+ * @id:          [out] handle for SLOT_MAP / WBUF_FREE
+ * @mmap_offset: [out] mmap() offset on this fd (write-combine: CPU writes reach DDR, no cache maintenance)
+ */
+struct aipu_wbuf_req {
+	__u64 bytes;
+	__u64 id;
+	__u64 mmap_offset;
+};
+
+/**
+ * struct aipu_slot_req - SLOT_ALLOC: a 2 MiB-aligned range of ASID 0's IOVA window with nothing mapped
+ * @bytes: [in]  size; rounded up to whole 2 MiB chunks
+ * @id:    [out] handle for SLOT_MAP / SLOT_FREE
+ * @pa:    [out] its NPU-view address
+ */
+struct aipu_slot_req {
+	__u64 bytes;
+	__u64 id;
+	__u64 pa;
+};
+
+/**
+ * struct aipu_slot_map - SLOT_MAP: point a slot at [offset, offset + bytes) of a weight buffer
+ * @slot_id: the slot
+ * @wbuf_id: the weight buffer
+ * @offset:  into the weight buffer, a multiple of 2 MiB
+ * @bytes:   rounded up to whole 2 MiB chunks, at most the slot's size; 0 unmaps the slot
+ *
+ * The previous mapping is removed (and the SMMU's TLB invalidated) before the new one is written. The caller
+ * must not map a slot a pending job still reads.
+ */
+struct aipu_slot_map {
+	__u64 slot_id;
+	__u64 wbuf_id;
+	__u64 offset;
+	__u64 bytes;
+};
+
+/**
  * DOC: AIPU_IOCTL_REBIND_DMA_BUF
  *
  * @Description
@@ -778,6 +819,18 @@ struct aipu_id_desc {
  * ioctl to request to bind dma shared fd memory to a reserved iova.
  */
 #define AIPU_IOCTL_BIND_DMA_BUF _IOWR(AIPU_IOCTL_MAGIC, 29, struct aipu_bind_buf_desc)
+/**
+ * DOC: AIPU_IOCTL_WBUF_ALLOC / WBUF_FREE / SLOT_ALLOC / SLOT_FREE / SLOT_MAP
+ * @Description
+ * Zero-copy weight streaming (V3 custom-IOVA hardware): weight memory lives outside the NPU's window in 2 MiB
+ * chunks; a slot (a window range) is re-pointed at a layer's chunks by SMMU block mappings instead of copying
+ * the layer into it. Freed with the fd; WBUF_FREE is refused while the buffer is mmap()ed or mapped in a slot.
+ */
+#define AIPU_IOCTL_WBUF_ALLOC _IOWR(AIPU_IOCTL_MAGIC, 30, struct aipu_wbuf_req)
+#define AIPU_IOCTL_WBUF_FREE _IOW(AIPU_IOCTL_MAGIC, 31, __u64)
+#define AIPU_IOCTL_SLOT_ALLOC _IOWR(AIPU_IOCTL_MAGIC, 32, struct aipu_slot_req)
+#define AIPU_IOCTL_SLOT_FREE _IOW(AIPU_IOCTL_MAGIC, 33, __u64)
+#define AIPU_IOCTL_SLOT_MAP _IOW(AIPU_IOCTL_MAGIC, 34, struct aipu_slot_map)
 
 /**
  * DOC: AIPU_IOCTL_GET_CLUSTER_STATUS

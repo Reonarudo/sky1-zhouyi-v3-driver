@@ -88,6 +88,9 @@ static int aipu_release(struct inode *inode, struct file *filp)
 	 */
 	aipu_detach_dma_buf_by_filp(&aipu->mm, filp);
 
+	/* Zero-copy weight slots and buffers of this fd (after its jobs were cancelled above). */
+	aipu_wslot_release(&aipu->mm, filp);
+
 #ifdef CONFIG_SKY1
 	sky1_npu_pm_runtime_put(aipu->dev);
 #endif
@@ -119,6 +122,10 @@ static long aipu_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	int fd = 0;
 
 	struct aipu_rebind_buf_desc rebind_buf;
+	struct aipu_wbuf_req wbuf_req;
+	struct aipu_slot_req slot_req;
+	struct aipu_slot_map slot_map;
+	__u64 wslot_id;
 
 	/*
 	 * misc_deregister() does not revoke fds that are already
@@ -376,6 +383,39 @@ static long aipu_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				ret = -EINVAL;
 		} else
 			ret = -EINVAL;
+		break;
+	case AIPU_IOCTL_WBUF_ALLOC:
+		if (copy_from_user(&wbuf_req, (void __user *)arg, sizeof(wbuf_req)))
+			return -EFAULT;
+		ret = aipu_wbuf_alloc(&aipu->mm, &wbuf_req, filp);
+		if (!ret && copy_to_user((void __user *)arg, &wbuf_req, sizeof(wbuf_req))) {
+			aipu_wbuf_free(&aipu->mm, wbuf_req.id, filp);
+			ret = -EFAULT;
+		}
+		break;
+	case AIPU_IOCTL_WBUF_FREE:
+		if (copy_from_user(&wslot_id, (void __user *)arg, sizeof(wslot_id)))
+			return -EFAULT;
+		ret = aipu_wbuf_free(&aipu->mm, wslot_id, filp);
+		break;
+	case AIPU_IOCTL_SLOT_ALLOC:
+		if (copy_from_user(&slot_req, (void __user *)arg, sizeof(slot_req)))
+			return -EFAULT;
+		ret = aipu_slot_alloc(&aipu->mm, &slot_req, filp);
+		if (!ret && copy_to_user((void __user *)arg, &slot_req, sizeof(slot_req))) {
+			aipu_slot_free(&aipu->mm, slot_req.id, filp);
+			ret = -EFAULT;
+		}
+		break;
+	case AIPU_IOCTL_SLOT_FREE:
+		if (copy_from_user(&wslot_id, (void __user *)arg, sizeof(wslot_id)))
+			return -EFAULT;
+		ret = aipu_slot_free(&aipu->mm, wslot_id, filp);
+		break;
+	case AIPU_IOCTL_SLOT_MAP:
+		if (copy_from_user(&slot_map, (void __user *)arg, sizeof(slot_map)))
+			return -EFAULT;
+		ret = aipu_slot_map(&aipu->mm, &slot_map, filp);
 		break;
 	case AIPU_IOCTL_BIND_DMA_BUF:
 		ret = -EINVAL;

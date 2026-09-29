@@ -10,6 +10,8 @@
 #include <linux/spinlock.h>
 #include <linux/scatterlist.h>
 #include <linux/iova.h>
+#include <linux/sizes.h>
+#include <linux/atomic.h>
 #include <linux/mm.h>
 #include <linux/highmem.h>
 #include <asm/cacheflush.h>
@@ -241,6 +243,35 @@ struct aipu_asid_iova_info {
 	u64 asid_base;		/* NPU view base address (e.g., 0, 4GB, 8GB...) */
 };
 
+/* Zero-copy weights: host memory in 2 MiB chunks (outside the window) and window slots re-pointed at it. */
+#define AIPU_WCHUNK		SZ_2M
+#define AIPU_WBUF_MMAP_BASE	(1ULL << 40)	/* mmap offsets of weight buffers: base + id << 36 (above every NPU-view address) */
+#define AIPU_WBUF_MMAP_SHIFT	36
+
+struct aipu_wbuf {
+	struct list_head node;
+	struct file *filp;
+	u64 id;
+	u32 nchunks;		/* 2 MiB units */
+	struct page **chunks;	/* per unit: an order-9 block, or NULL and its 512 pages in small[] */
+	struct page ***small;	/* per unit: NULL, or 512 order-0 pages (no contiguous block was available) */
+	u32 nbig;
+	atomic_t mmaps;		/* live user mappings (vm_ops open/close) */
+	u32 slot_refs;		/* slots currently mapping it (under wslot_lock) */
+};
+
+struct aipu_slot {
+	struct list_head node;
+	struct file *filp;
+	u64 id;
+	struct iova *iova;	/* the reserved range (size + one chunk of alignment slack) */
+	u64 iova_start;		/* 2 MiB aligned */
+	u64 bytes;		/* whole chunks */
+	u64 reserved;		/* accounted in asid_iova[0].iova_used */
+	u64 mapped;		/* bytes currently mapped from the slot's start */
+	struct aipu_wbuf *wbuf;	/* what is mapped, or NULL */
+};
+
 struct aipu_memory_manager {
 	int version;
 	bool has_iommu;
@@ -276,6 +307,9 @@ struct aipu_memory_manager {
 	struct aipu_asid_iova_info asid_iova[ZHOUYI_ASID_COUNT];
 	spinlock_t asid_lock;	/* Serialize asid_iova[].iova_used accounting */
 	struct aipu_tcb_buf *v3_tcb_buf_head;	/* V3 custom IOVA TCB buffer list */
+	struct list_head wbufs, slots;	/* zero-copy weights (aipu_wbuf, aipu_slot) */
+	struct mutex wslot_lock;
+	u64 wslot_next_id;
 };
 
 int aipu_init_mm(struct aipu_memory_manager *mm, struct platform_device *p_dev, int version);
@@ -295,6 +329,13 @@ int aipu_mm_mmap_buf(struct aipu_memory_manager *mm, struct vm_area_struct *vma,
 
 /* V3 custom IOVA support */
 int aipu_mm_v3_init_iova_domain(struct aipu_memory_manager *mm);
+int aipu_wbuf_alloc(struct aipu_memory_manager *mm, struct aipu_wbuf_req *req, struct file *filp);
+int aipu_wbuf_free(struct aipu_memory_manager *mm, u64 id, struct file *filp);
+int aipu_wbuf_mmap(struct aipu_memory_manager *mm, struct vm_area_struct *vma, struct file *filp);
+int aipu_slot_alloc(struct aipu_memory_manager *mm, struct aipu_slot_req *req, struct file *filp);
+int aipu_slot_free(struct aipu_memory_manager *mm, u64 id, struct file *filp);
+int aipu_slot_map(struct aipu_memory_manager *mm, struct aipu_slot_map *map, struct file *filp);
+void aipu_wslot_release(struct aipu_memory_manager *mm, struct file *filp);
 void aipu_mm_v3_deinit_iova_domain(struct aipu_memory_manager *mm);
 struct aipu_iova_buffer *aipu_mm_v3_alloc_iova(struct aipu_memory_manager *mm,
 					       struct aipu_buf_request *buf_req,
