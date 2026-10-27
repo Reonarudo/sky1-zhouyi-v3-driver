@@ -64,6 +64,159 @@ static int init_cache_ops(struct aipu_memory_manager *mm);
 static void aipu_debug_print_buffers(struct aipu_memory_manager *mm);
 static struct aipu_iova_buffer *aipu_get_iova_buffer(struct aipu_memory_manager *mm, u64 iova, char* str);
 static char *aipu_mm_v3_kva_by_pa(struct aipu_memory_manager *mm, u64 dev_pa);
+
+/*
+ * The address indexes (kmd-walk). Every job submit resolves a handful of
+ * caller-supplied addresses to their buffers: three ownership checks
+ * (aipu_mm_v3_pa_owned_by), two kernel aliases of TCBs (aipu_mm_get_tcb) and
+ * two TCB descriptors (aipu_mm_v3_find_tcb_buf_no_lock). Each used to walk a
+ * list of every buffer on the device, ~30 ns a buffer under buffer_mutex: a
+ * submit cost 22 us with a few buffers and 608 us with 20 000. The lists stay
+ * (fd-close sweeps, exec_id lookups and the debug dump walk them, none per
+ * submit); these trees answer the address lookups.
+ *
+ * mm->buffer_tree holds every buffer on buffer_list, keyed by iova_start,
+ * under buffer_mutex. Buffer IOVA ranges come from the one iova_domain and are
+ * removed from the tree before their IOVA is returned to it, so the ranges in
+ * the tree are disjoint and the floor lookup below returns the one buffer the
+ * list walk would have returned, or none.
+ */
+static void aipu_buffer_tree_insert(struct aipu_memory_manager *mm,
+				    struct aipu_iova_buffer *buffer)
+{
+	struct rb_node **link = &mm->buffer_tree.rb_node, *parent = NULL;
+	struct rb_node *nb;
+	struct aipu_iova_buffer *b;
+
+	while (*link) {
+		parent = *link;
+		b = rb_entry(parent, struct aipu_iova_buffer, rb);
+		if (buffer->iova_start < b->iova_start)
+			link = &parent->rb_left;
+		else
+			link = &parent->rb_right;
+	}
+	rb_link_node(&buffer->rb, parent, link);
+	rb_insert_color(&buffer->rb, &mm->buffer_tree);
+
+	/* the disjointness the lookups rely on; iova_domain guarantees it */
+	nb = rb_prev(&buffer->rb);
+	if (nb) {
+		b = rb_entry(nb, struct aipu_iova_buffer, rb);
+		WARN_ONCE(b->iova_start + b->iova_size > buffer->iova_start,
+			  "aipu_mm: buffer IOVA 0x%llx+0x%llx overlaps 0x%llx+0x%llx\n",
+			  buffer->iova_start, buffer->iova_size, b->iova_start, b->iova_size);
+	}
+	nb = rb_next(&buffer->rb);
+	if (nb) {
+		b = rb_entry(nb, struct aipu_iova_buffer, rb);
+		WARN_ONCE(buffer->iova_start + buffer->iova_size > b->iova_start,
+			  "aipu_mm: buffer IOVA 0x%llx+0x%llx overlaps 0x%llx+0x%llx\n",
+			  buffer->iova_start, buffer->iova_size, b->iova_start, b->iova_size);
+	}
+}
+
+static void aipu_buffer_tree_erase(struct aipu_memory_manager *mm,
+				   struct aipu_iova_buffer *buffer)
+{
+	if (RB_EMPTY_NODE(&buffer->rb))
+		return;
+	rb_erase(&buffer->rb, &mm->buffer_tree);
+	RB_CLEAR_NODE(&buffer->rb);
+}
+
+/* the buffer whose IOVA range contains @iova, or NULL; under buffer_mutex */
+static struct aipu_iova_buffer *aipu_buffer_tree_find(struct aipu_memory_manager *mm, u64 iova)
+{
+	struct rb_node *n = mm->buffer_tree.rb_node;
+	struct aipu_iova_buffer *b, *floor = NULL;
+
+	while (n) {
+		b = rb_entry(n, struct aipu_iova_buffer, rb);
+		if (iova < b->iova_start) {
+			n = n->rb_left;
+		} else {
+			floor = b;
+			n = n->rb_right;
+		}
+	}
+	if (floor && iova - floor->iova_start < floor->iova_size)
+		return floor;
+	return NULL;
+}
+
+/*
+ * mm->v3_tcb_tree: the V3 TCB descriptors on v3_tcb_buf_head, keyed by head,
+ * under mm->slock. A descriptor leaves the tree (and the list) when the
+ * buffer holding it is destroyed -- by FREE_BUF as before, and now also at
+ * fd close, which used to leave it on the list for the module's lifetime.
+ */
+static void aipu_tcb_tree_insert(struct aipu_memory_manager *mm, struct aipu_tcb_buf *tbuf)
+{
+	struct rb_node **link = &mm->v3_tcb_tree.rb_node, *parent = NULL;
+	struct aipu_tcb_buf *t;
+
+	while (*link) {
+		parent = *link;
+		t = rb_entry(parent, struct aipu_tcb_buf, rb);
+		if (tbuf->head == t->head) {
+			/* cannot happen while buffers are disjoint; keep the new one findable */
+			WARN_ONCE(1, "aipu_mm: two TCB descriptors at 0x%llx\n", tbuf->head);
+			rb_replace_node(parent, &tbuf->rb, &mm->v3_tcb_tree);
+			RB_CLEAR_NODE(&t->rb);
+			return;
+		}
+		if (tbuf->head < t->head)
+			link = &parent->rb_left;
+		else
+			link = &parent->rb_right;
+	}
+	rb_link_node(&tbuf->rb, parent, link);
+	rb_insert_color(&tbuf->rb, &mm->v3_tcb_tree);
+}
+
+/* unlink a V3 TCB descriptor from the tree and the list and free it; under slock */
+static void aipu_tcb_buf_remove_no_lock(struct aipu_memory_manager *mm, struct aipu_tcb_buf *tbuf)
+{
+	if (!RB_EMPTY_NODE(&tbuf->rb)) {
+		rb_erase(&tbuf->rb, &mm->v3_tcb_tree);
+		RB_CLEAR_NODE(&tbuf->rb);
+	}
+	list_del(&tbuf->node);
+	kmem_cache_free(mm->tbuf_cache, tbuf);
+}
+
+/* drop every V3 TCB descriptor whose head lies in [lo, hi) */
+static void aipu_tcb_bufs_drop_range(struct aipu_memory_manager *mm, u64 lo, u64 hi)
+{
+	struct rb_node *n, *next;
+	struct aipu_tcb_buf *t, *first = NULL;
+	unsigned long flags;
+
+	if (!mm->v3_tcb_buf_head || lo >= hi)
+		return;
+
+	spin_lock_irqsave(&mm->slock, flags);
+	n = mm->v3_tcb_tree.rb_node;
+	while (n) {
+		t = rb_entry(n, struct aipu_tcb_buf, rb);
+		if (t->head >= lo) {
+			first = t;
+			n = n->rb_left;
+		} else {
+			n = n->rb_right;
+		}
+	}
+	for (n = first ? &first->rb : NULL; n; n = next) {
+		t = rb_entry(n, struct aipu_tcb_buf, rb);
+		if (t->head >= hi)
+			break;
+		next = rb_next(n);
+		aipu_tcb_buf_remove_no_lock(mm, t);
+	}
+	spin_unlock_irqrestore(&mm->slock, flags);
+}
+
 int aipu_mm_hold_tcb_buf_alloc(struct aipu_memory_manager *mm, struct aipu_job *kern_job)
 {
 	struct aipu_hold_tcb_buf *htbuf = NULL;
@@ -2056,11 +2209,10 @@ static struct aipu_iova_buffer *aipu_get_iova_buffer(struct aipu_memory_manager 
 
 	//pr_info("%s iova 0x%llx +\n", __FUNCTION__, iova);
 	mutex_lock(&mm->buffer_mutex);
-	list_for_each_entry(buffer, &mm->buffer_list, node) {
-		if ((iova - buffer->iova_start) < buffer->iova_size) {
-			mutex_unlock(&mm->buffer_mutex);
-			return buffer;
-		}
+	buffer = aipu_buffer_tree_find(mm, iova);
+	if (buffer) {
+		mutex_unlock(&mm->buffer_mutex);
+		return buffer;
 	}
 	dev_err(mm->dev, "tid %d pid %d can't find iova 0x%llx %s\n",
 		task_tgid_nr(current), task_pid_nr(current), iova, str);
@@ -2112,6 +2264,7 @@ static int aipu_insert_buffer_safe(struct aipu_memory_manager *mm,
 
 	mutex_lock(&mm->buffer_mutex);
 	list_add_tail(&new_buffer->node, &mm->buffer_list);
+	aipu_buffer_tree_insert(mm, new_buffer);
 	mm->buffer_count++;
 	mutex_unlock(&mm->buffer_mutex);
 	//dev_info(mm->dev, "Successfully inserted buffer: IOVA=0x%llx\n",
@@ -2170,6 +2323,7 @@ static struct aipu_iova_buffer* aipu_alloc_iova(struct aipu_memory_manager *mm,
 	buffer->pid = task_pid_nr(current);
 	buffer->exec_id = buf_req->exec_id;
 	INIT_LIST_HEAD(&buffer->phy_blocks);
+	RB_CLEAR_NODE(&buffer->rb);
 	mutex_init(&buffer->phy_mutex);
 
 	if(aipu_insert_buffer_safe(mm, buffer)){
@@ -2200,6 +2354,7 @@ static void aipu_free_iova(struct aipu_memory_manager *mm, struct aipu_iova_buff
 	}
 
 	list_del(&buffer->node);
+	aipu_buffer_tree_erase(mm, buffer);
 	mm->buffer_count--;
 	free_iova(&mm->iova_domain, pfn_lo);
 	kfree(buffer);
@@ -2520,6 +2675,7 @@ int aipu_alloc_dma_iova_phy(struct aipu_memory_manager *mm, struct aipu_buf_requ
 			tbuf = kmem_cache_zalloc(mm->tbuf_cache, GFP_KERNEL);
 			if (tbuf) {
 				INIT_LIST_HEAD(&tbuf->node);
+				RB_CLEAR_NODE(&tbuf->rb);
 				tbuf->reg = NULL;
 				tbuf->head = buf_req->desc.pa;
 				tbuf->tail = buf_req->desc.pa + buf_req->desc.bytes -
@@ -2530,6 +2686,7 @@ int aipu_alloc_dma_iova_phy(struct aipu_memory_manager *mm, struct aipu_buf_requ
 
 				spin_lock_irqsave(&mm->slock, flags);
 				list_add_tail(&tbuf->node, &mm->v3_tcb_buf_head->node);
+				aipu_tcb_tree_insert(mm, tbuf);
 				spin_unlock_irqrestore(&mm->slock, flags);
 			}
 		}
@@ -2642,16 +2799,10 @@ static struct aipu_iova_buffer *aipu_mm_v3_find_buffer_by_iova(struct aipu_memor
 	struct aipu_iova_buffer *buffer;
 
 	mutex_lock(&mm->buffer_mutex);
-	list_for_each_entry(buffer, &mm->buffer_list, node) {
-		if (iova >= buffer->iova_start &&
-		    iova < buffer->iova_start + buffer->iova_size) {
-			mutex_unlock(&mm->buffer_mutex);
-			return buffer;
-		}
-	}
+	buffer = aipu_buffer_tree_find(mm, iova);
 	mutex_unlock(&mm->buffer_mutex);
 
-	return NULL;
+	return buffer;
 }
 
 /**
@@ -2686,20 +2837,13 @@ static struct aipu_iova_buffer *aipu_mm_v3_find_owned_buffer_by_iova(struct aipu
 	struct aipu_iova_buffer *buffer;
 
 	mutex_lock(&mm->buffer_mutex);
-	list_for_each_entry(buffer, &mm->buffer_list, node) {
-		if (iova < buffer->iova_start ||
-		    iova >= buffer->iova_start + buffer->iova_size)
-			continue;
-		if (buffer->filp == filp) {
-			mutex_unlock(&mm->buffer_mutex);
-			return buffer;
-		}
-		/* address resolves, but not to a buffer this owner may touch */
-		break;
-	}
+	buffer = aipu_buffer_tree_find(mm, iova);
+	/* address resolves, but not to a buffer this owner may touch */
+	if (buffer && buffer->filp != filp)
+		buffer = NULL;
 	mutex_unlock(&mm->buffer_mutex);
 
-	return NULL;
+	return buffer;
 }
 
 /**
@@ -2753,15 +2897,24 @@ bool aipu_mm_v3_pa_owned_by(struct aipu_memory_manager *mm, u64 pa, struct file 
 static struct aipu_tcb_buf *aipu_mm_v3_find_tcb_buf_no_lock(struct aipu_memory_manager *mm,
 							    u64 pa)
 {
-	struct aipu_tcb_buf *curr;
+	struct rb_node *n = mm->v3_tcb_tree.rb_node;
+	struct aipu_tcb_buf *curr, *floor = NULL;
 
 	if (!mm->v3_tcb_buf_head)
 		return NULL;
 
-	list_for_each_entry(curr, &mm->v3_tcb_buf_head->node, node) {
-		if (pa >= curr->head && pa <= curr->tail)
-			return curr;
+	/* the descriptor with the greatest head <= pa; its tail is live state (hold_tcb_buf_alloc moves it) */
+	while (n) {
+		curr = rb_entry(n, struct aipu_tcb_buf, rb);
+		if (pa < curr->head) {
+			n = n->rb_left;
+		} else {
+			floor = curr;
+			n = n->rb_right;
+		}
 	}
+	if (floor && pa <= floor->tail)
+		return floor;
 
 	return NULL;
 }
@@ -2820,10 +2973,8 @@ int aipu_free_dma_iova_phy(struct aipu_memory_manager *mm, struct aipu_buf_desc 
 
 			spin_lock_irqsave(&mm->slock, tflags);
 			tbuf = aipu_mm_v3_find_tcb_buf_no_lock(mm, desc->pa);
-			if (tbuf) {
-				list_del(&tbuf->node);
-				kmem_cache_free(mm->tbuf_cache, tbuf);
-			}
+			if (tbuf)
+				aipu_tcb_buf_remove_no_lock(mm, tbuf);
 			spin_unlock_irqrestore(&mm->slock, tflags);
 
 		}
@@ -3046,6 +3197,8 @@ int aipu_mm_v3_init_iova_domain(struct aipu_memory_manager *mm)
 	mutex_init(&mm->buffer_mutex);
 	spin_lock_init(&mm->asid_lock);
 	INIT_LIST_HEAD(&mm->buffer_list);
+	mm->buffer_tree = RB_ROOT;
+	mm->v3_tcb_tree = RB_ROOT;
 	/* 16GB total IOVA needs 34-bit DMA mask */
 	mm->dma_mask = 34;
 	init_cache_ops(mm);
@@ -3121,6 +3274,7 @@ void aipu_mm_v3_deinit_iova_domain(struct aipu_memory_manager *mm)
 			list_del(&tbuf->node);
 			kmem_cache_free(mm->tbuf_cache, tbuf);
 		}
+		mm->v3_tcb_tree = RB_ROOT;
 		spin_unlock_irqrestore(&mm->slock, flags);
 		kmem_cache_free(mm->tbuf_cache, mm->v3_tcb_buf_head);
 		mm->v3_tcb_buf_head = NULL;
@@ -3200,6 +3354,30 @@ aipu_mm_v3_dump_asid_state(struct aipu_memory_manager *mm, u32 asid)
  * 
  * Return: allocated buffer or NULL on failure
  */
+/*
+ * aipu_mm_v3_iova_search_from_top - start the next alloc_iova() at the domain's top
+ *
+ * alloc_iova() searches downward from the domain's cached last 64-bit insertion,
+ * which is device-wide. After anything was placed in ASID 1 that node sits inside
+ * ASID 1, so a later request for ASID 2 or 3 is placed below it -- in ASID 1's
+ * range -- and refused by the range check ("IOVA ... outside ASID n range"), and
+ * the higher ASIDs stay unusable until the driver is reloaded. Resetting the
+ * cache to the anchor (what the allocator itself does when the cached node is
+ * freed) makes the search start at the top; the never-map zones bound each ASID
+ * slot from below, so the request lands in its own slot. ASID 0's limit is under
+ * 4 GiB and takes the 32-bit cache, which this leaves alone.
+ */
+static void aipu_mm_v3_iova_search_from_top(struct iova_domain *iovad, u32 asid)
+{
+	unsigned long flags;
+
+	if (!asid)
+		return;
+	spin_lock_irqsave(&iovad->iova_rbtree_lock, flags);
+	iovad->cached_node = &iovad->anchor.node;
+	spin_unlock_irqrestore(&iovad->iova_rbtree_lock, flags);
+}
+
 struct aipu_iova_buffer *aipu_mm_v3_alloc_iova(struct aipu_memory_manager *mm,
 						struct aipu_buf_request *buf_req,
 						struct file *filp)
@@ -3273,6 +3451,7 @@ struct aipu_iova_buffer *aipu_mm_v3_alloc_iova(struct aipu_memory_manager *mm,
 	 * power-of-2 >= size, wasting huge amounts of IOVA space (e.g. a 1.5GB
 	 * alloc would require a 2GB-aligned start, failing in a 3GB range).
 	 */
+	aipu_mm_v3_iova_search_from_top(iovad, asid);
 	iova = alloc_iova(iovad, iova_size >> PAGE_SHIFT, pfn_hi, false);
 	if (!iova) {
 		dev_err(mm->dev, "V3: alloc_iova failed for ASID %d, size 0x%llx\n",
@@ -3329,6 +3508,7 @@ struct aipu_iova_buffer *aipu_mm_v3_alloc_iova(struct aipu_memory_manager *mm,
 	buffer->exec_id = buf_req->exec_id;
 	buffer->data_type = buf_req->data_type;
 	INIT_LIST_HEAD(&buffer->phy_blocks);
+	RB_CLEAR_NODE(&buffer->rb);
 	mutex_init(&buffer->phy_mutex);
 
 	/* Return IOVA as pa (this will be adjusted later if needed) */
@@ -3341,6 +3521,7 @@ struct aipu_iova_buffer *aipu_mm_v3_alloc_iova(struct aipu_memory_manager *mm,
 	/* Add to buffer list */
 	mutex_lock(&mm->buffer_mutex);
 	list_add_tail(&buffer->node, &mm->buffer_list);
+	aipu_buffer_tree_insert(mm, buffer);
 	mm->buffer_count++;
 	mutex_unlock(&mm->buffer_mutex);
 
@@ -3595,7 +3776,7 @@ static void *aipu_mm_v3_block_kva(struct aipu_memory_manager *mm,
  * windows are disjoint (asid_base = asid * 4 GB, window 3 GB), so at most one
  * translates a given PA and the rest return 0.
  *
- * This walks mm->buffer_list itself rather than calling
+ * This looks the buffer up itself (mm->buffer_tree) rather than calling
  * aipu_mm_v3_find_block_by_iova, and the difference is the point:
  * that function returns a block with both mutexes already dropped, which is
  * sound for a caller that only reads block->va but not for one that WRITES it.
@@ -3634,32 +3815,28 @@ static char *aipu_mm_v3_kva_by_pa(struct aipu_memory_manager *mm, u64 dev_pa)
 		if (!iova)
 			continue;
 
-		list_for_each_entry(buffer, &mm->buffer_list, node) {
+		buffer = aipu_buffer_tree_find(mm, iova);
+		if (!buffer || buffer->asid != asid)
+			continue;
+
+		mutex_lock(&buffer->phy_mutex);
+		list_for_each_entry(block, &buffer->phy_blocks, list) {
 			void *kva;
 
-			if (buffer->asid != asid)
-				continue;
-			if (iova < buffer->iova_start ||
-			    iova >= buffer->iova_start + buffer->iova_size)
+			if (iova < block->iova_start ||
+			    iova >= block->iova_start + block->size)
 				continue;
 
-			mutex_lock(&buffer->phy_mutex);
-			list_for_each_entry(block, &buffer->phy_blocks, list) {
-				if (iova < block->iova_start ||
-				    iova >= block->iova_start + block->size)
-					continue;
-
-				kva = aipu_mm_v3_block_kva(mm, block);
-				if (kva)
-					va = (char *)kva + (iova - block->iova_start);
-				break;
-			}
-			mutex_unlock(&buffer->phy_mutex);
-			if (va)
-				goto out;
+			kva = aipu_mm_v3_block_kva(mm, block);
+			if (kva)
+				va = (char *)kva + (iova - block->iova_start);
+			break;
 		}
+		mutex_unlock(&buffer->phy_mutex);
+		if (va)
+			break;
 	}
-out:
+
 	mutex_unlock(&mm->buffer_mutex);
 
 	return va;
@@ -3683,14 +3860,8 @@ struct aipu_phy_block *aipu_mm_v3_find_block_by_iova(struct aipu_memory_manager 
 		return NULL;
 
 	mutex_lock(&mm->buffer_mutex);
-	list_for_each_entry(buffer, &mm->buffer_list, node) {
-		if (buffer->asid != asid)
-			continue;
-		
-		if (iova < buffer->iova_start ||
-		    iova >= buffer->iova_start + buffer->iova_size)
-			continue;
-
+	buffer = aipu_buffer_tree_find(mm, iova);
+	if (buffer && buffer->asid == asid) {
 		mutex_lock(&buffer->phy_mutex);
 		list_for_each_entry(block, &buffer->phy_blocks, list) {
 			if (iova >= block->iova_start &&
@@ -3859,6 +4030,7 @@ int aipu_mm_v3_map_imported_sgt(struct aipu_memory_manager *mm, struct sg_table 
 	pfn_hi = ((asid_info->iova_base + asid_info->iova_size) >> PAGE_SHIFT) - 1;
 
 	/* size_aligned=false: page alignment is enough (see aipu_mm_v3_alloc_iova). */
+	aipu_mm_v3_iova_search_from_top(iovad, asid);
 	iova = alloc_iova(iovad, size >> PAGE_SHIFT, pfn_hi, false);
 	if (!iova) {
 		dev_err(mm->dev, "V3: alloc_iova failed for import (ASID %d, size 0x%llx)\n",
@@ -3968,6 +4140,19 @@ void aipu_mm_v3_destroy_buffer_now(struct aipu_memory_manager *mm,
 	if (!mm || !buffer)
 		return;
 
+	/*
+	 * The buffer's V3 TCB descriptors go with it (kmd-walk). FREE_BUF
+	 * always dropped the one at the freed address; fd close dropped none,
+	 * so they stayed on the list for the module's lifetime and shadowed
+	 * any later buffer given the same IOVA.
+	 */
+	{
+		u64 pa = aipu_mm_v3_iova_to_pa(mm, buffer->iova_start, buffer->asid);
+
+		if (pa)
+			aipu_tcb_bufs_drop_range(mm, pa, pa + buffer->iova_size);
+	}
+
 	/* Unmap and free all physical blocks */
 	mutex_lock(&buffer->phy_mutex);
 	list_for_each_entry_safe(block, tmp, &buffer->phy_blocks, list) {
@@ -4006,14 +4191,19 @@ void aipu_mm_v3_destroy_buffer_now(struct aipu_memory_manager *mm,
 		spin_unlock(&mm->asid_lock);
 	}
 
-	/* Free IOVA from domain */
-	free_iova(iovad, buffer->iova_start >> PAGE_SHIFT);
-
-	/* Remove from buffer list */
+	/*
+	 * Remove from buffer list (and tree) BEFORE the IOVA goes back to the
+	 * domain: a concurrent allocation may be handed the same range at once,
+	 * and the address lookups rely on the published ranges being disjoint.
+	 */
 	mutex_lock(&mm->buffer_mutex);
 	list_del(&buffer->node);
+	aipu_buffer_tree_erase(mm, buffer);
 	mm->buffer_count--;
 	mutex_unlock(&mm->buffer_mutex);
+
+	/* Free IOVA from domain */
+	free_iova(iovad, buffer->iova_start >> PAGE_SHIFT);
 
 	dev_dbg(mm->dev, "V3: freed buffer IOVA 0x%llx size 0x%llx ASID %d\n",
 		buffer->iova_start, buffer->iova_size, buffer->asid);

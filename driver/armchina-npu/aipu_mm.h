@@ -6,6 +6,7 @@
 
 #include <linux/platform_device.h>
 #include <linux/list.h>
+#include <linux/rbtree.h>
 #include <linux/mutex.h>
 #include <linux/spinlock.h>
 #include <linux/scatterlist.h>
@@ -131,6 +132,7 @@ struct aipu_iova_buffer {
 	int tgid;
 	int pid;
 	struct list_head node;
+	struct rb_node rb;	/* in mm->buffer_tree, keyed by iova_start (under buffer_mutex) */
 	u64 exec_id;
 	u32 data_type;		/* DEBUG: aipu_mm_data_type captured at alloc */
 	/*
@@ -156,6 +158,7 @@ struct aipu_iova_buffer {
  * @node: list node
  * @pinned: is this buffer should be maintained after executions
  * @reg: pointer to the region contains this TCB
+ * @rb: V3 custom IOVA only: node in mm->v3_tcb_tree, keyed by @head (under mm->slock)
  */
 struct aipu_tcb_buf {
 	u64 head;
@@ -163,6 +166,7 @@ struct aipu_tcb_buf {
 	int dep_job_id;
 	struct aipu_tcb *tail_tcb;
 	struct list_head node;
+	struct rb_node rb;
 	bool pinned;
 	struct aipu_mem_region *reg;
 };
@@ -297,6 +301,14 @@ struct aipu_memory_manager {
 	struct iova_domain iova_domain;
 	struct mutex buffer_mutex;
 	struct list_head buffer_list;
+	/*
+	 * The same buffers as buffer_list, indexed by iova_start, under
+	 * buffer_mutex. Every allocated IOVA range comes from iova_domain, so
+	 * the live ranges are disjoint and an address resolves to at most one
+	 * buffer: the tree answers in O(log n) what the list walk answered in
+	 * O(n) (~30 ns a buffer, on every job submit).
+	 */
+	struct rb_root buffer_tree;
 	u64 iova_base;
 	u64 iova_size;
 	u32 buffer_count;
@@ -307,6 +319,7 @@ struct aipu_memory_manager {
 	struct aipu_asid_iova_info asid_iova[ZHOUYI_ASID_COUNT];
 	spinlock_t asid_lock;	/* Serialize asid_iova[].iova_used accounting */
 	struct aipu_tcb_buf *v3_tcb_buf_head;	/* V3 custom IOVA TCB buffer list */
+	struct rb_root v3_tcb_tree;		/* the same tbufs, keyed by head (under slock) */
 	struct list_head wbufs, slots;	/* zero-copy weights (aipu_wbuf, aipu_slot) */
 	struct mutex wslot_lock;
 	u64 wslot_next_id;
