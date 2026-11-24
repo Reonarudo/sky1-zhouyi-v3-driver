@@ -11,6 +11,11 @@ SoCs is removed, and a set of fixes and additions sits on top (see below).
 
 This project is not affiliated with CIX or Arm China.
 
+> ⚠️ **Work in progress.** This is the driver we develop the NPU examples against, published as it
+> stands. It is in daily use on one board and kernel (below), but its interface additions, defaults
+> and kernel support may still change, and it has not been tested beyond that setup. Please report
+> what you find in an [issue](https://github.com/Reonarudo/sky1-zhouyi-v3-driver/issues).
+
 ## Kernel support
 
 | Kernel | Status |
