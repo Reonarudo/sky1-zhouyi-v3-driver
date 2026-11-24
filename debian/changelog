@@ -1,3 +1,13 @@
+cix-npu-driver (6.2.0-1+zv3.1) stable; urgency=medium
+
+  * Zhouyi V3 / CIX Sky1 build of the CIX 6.2.0-1 driver: code for other
+    architectures and SoCs removed, probe/teardown/IRQ/ioctl hardening,
+    buffer ownership checks, retire-on-drain completion, report-only job
+    deadline, zero-copy weight ioctls (WBUF/SLOT, 30-34).
+  * Builds on 6.6.x-cix kernels as well as 7.0.
+
+ -- Leonardo Marques <leonardo.j.marques@gmail.com>  Tue, 24 Nov 2026 12:00:00 +0100
+
 cix-npu-driver (6.2.0-1) stable; urgency=medium
 
   * Update to new version 6.2.0-1

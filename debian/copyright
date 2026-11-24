@@ -1,5 +1,5 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
-Source: <url://example.com>
+Source: https://github.com/Reonarudo/sky1-zhouyi-v3-driver
 Upstream-Name: cix-npu-driver
 Upstream-Contact: <preferred name and address to reach the upstream project>
 
@@ -7,6 +7,7 @@ Files:
  *
 Copyright:
  2026 Cix Technology Group Co., Ltd.
+ 2026 Leonardo Marques <leonardo.j.marques@gmail.com>
 License: GPL-2+
 
 Files:

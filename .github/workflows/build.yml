@@ -1,0 +1,80 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: DKMS package
+    runs-on: ubuntu-24.04-arm
+    container: debian:trixie
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build cix-npu-driver-dkms
+        run: sh .github/ci/build-deb.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cix-npu-driver-dkms
+          path: dist/*.deb
+          if-no-files-found: error
+
+  dkms:
+    name: DKMS build on ${{ matrix.kernel }}
+    needs: package
+    runs-on: ubuntu-24.04-arm
+    container: debian:${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # CIX vendor kernel headers, pinned by checksum (archive.cixtech.com, pool main/l/linux-upstream).
+          - kernel: 6.6.89-cix
+            image: bookworm
+            url: https://archive.cixtech.com/debian/pool/main/l/linux-upstream/linux-headers-6.6.89-cix-build-generic_6.6.89-cixdeb12-260811_arm64.deb
+            sha256: a40c79d373fad50d700e73be84bf4d8352a8ae85826525625e19765f3612171b
+          - kernel: 7.0.0
+            image: trixie
+            url: https://archive.cixtech.com/debian/pool/main/l/linux-upstream/linux-headers-7.0.0-generic_7.0.0-g972eaec2228c-1_arm64.deb
+            sha256: c7cd906722ebdbc980abd40bca5962779c044aeaa0ff3d363d1f096ff6c6c3e5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: cix-npu-driver-dkms
+          path: dist
+      - name: Install the package and build the module with DKMS
+        env:
+          KHDR_URL: ${{ matrix.url }}
+          KHDR_SHA256: ${{ matrix.sha256 }}
+        run: sh .github/ci/dkms-test.sh dist/*.deb
+
+  release:
+    name: Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: dkms
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: cix-npu-driver-dkms
+          path: dist
+      - name: Check the tag matches the package version
+        run: |
+          deb_version="$(dpkg-deb -f dist/*.deb Version)"
+          if [ "${GITHUB_REF_NAME#v}" != "$deb_version" ]; then
+            echo "tag $GITHUB_REF_NAME does not match package version $deb_version (debian/changelog)" >&2
+            exit 1
+          fi
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/*.deb --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes

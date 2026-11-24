@@ -1,19 +1,21 @@
 Source: cix-npu-driver
 Section: misc
 Priority: optional
-Maintainer: Jianfeng Liu <Jianfeng.Liu@cixtech.com>
+Maintainer: Leonardo Marques <leonardo.j.marques@gmail.com>
 Rules-Requires-Root: no
 Build-Depends:
  debhelper-compat (= 13),
  dh-exec,
  dh-sequence-dkms
 Standards-Version: 4.6.2
-Homepage: https://developer.cixtech.com/
-Vcs-Browser: https://github.com/cixtech/cix_opensource__npu_driver
-Vcs-Git: https://github.com/cixtech/cix_opensource__npu_driver.git
+Homepage: https://github.com/Reonarudo/sky1-zhouyi-v3-driver
+Vcs-Browser: https://github.com/Reonarudo/sky1-zhouyi-v3-driver
+Vcs-Git: https://github.com/Reonarudo/sky1-zhouyi-v3-driver.git
 
 Package: cix-npu-driver-dkms
 Architecture: all
 Depends:
  ${misc:Depends},
-Description: dkms source for CIX NPU driver
+Description: dkms source for the CIX Sky1 Zhouyi V3 NPU driver
+ Kernel driver (aipu) for the Zhouyi V3 NPU of the CIX Sky1 / P1 SoC,
+ derived from CIX's 6.2.0-1 release. Builds on 6.6.x-cix and 7.0 kernels.
