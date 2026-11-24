@@ -5,6 +5,7 @@
  */
 
 #include <linux/module.h>
+#include <linux/version.h>
 #include <linux/platform_device.h>
 #include <linux/of.h>
 #include <linux/clk.h>
@@ -74,7 +75,11 @@ static int aipu_scmi_device_opp_table_parse(struct device *dev)
 
 	perf_ops = pd->perf_ops;
 	ph = pd->ph;
+#if KERNEL_VERSION(6, 7, 0) <= LINUX_VERSION_CODE
 	ret = perf_ops->device_opps_add(ph, dev, pd->domain_id);
+#else
+	ret = perf_ops->device_opps_add(ph, dev);
+#endif
 	if (ret) {
 		dev_err(dev, "failed to add opps to the device\n");
 		return ret;
@@ -349,7 +354,13 @@ int sky1_npu_pm_runtime_put(struct device *dev)
 #ifdef CONFIG_PM
 	int ret = 0;
 
+#if KERNEL_VERSION(7, 0, 0) > LINUX_VERSION_CODE
+	ret = pm_runtime_put(dev);
+	if (ret < 0)
+		dev_err(dev, "PM runtime put failed! ret=%d", ret);
+#else
 	pm_runtime_put(dev);
+#endif
 
 	return ret;
 #else /* !CONFIG_PM  */
@@ -584,8 +595,17 @@ static int sky1_npu_runtime_suspend(struct device *dev)
 		return ret;
 	}
 
-	for (int i = 0; i < CIX_NPU_PD_NUM; i++)
+	for (int i = 0; i < CIX_NPU_PD_NUM; i++) {
+#if KERNEL_VERSION(7, 0, 0) > LINUX_VERSION_CODE
+		ret = pm_runtime_put(cix_aipu_priv->pd_core[i]);
+		if (ret < 0) {
+			dev_err(cix_aipu_priv->pd_core[i], "NPU core PM runtime put failed! ret=%d", ret);
+			return ret;
+		}
+#else
 		pm_runtime_put(cix_aipu_priv->pd_core[i]);
+#endif
+	}
 
 	return ret;
 }
@@ -646,7 +666,11 @@ MODULE_DEVICE_TABLE(acpi, aipu_acpi_match);
 
 static struct platform_driver aipu_platform_driver = {
 	.probe = sky1_npu_probe,
+#if KERNEL_VERSION(6, 11, 0) <= LINUX_VERSION_CODE
 	.remove = sky1_npu_remove,
+#else
+	.remove_new = sky1_npu_remove,
+#endif
 	.driver = {
 		.name = "armchina",
 		.owner = THIS_MODULE,

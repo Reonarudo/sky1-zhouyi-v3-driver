@@ -2,6 +2,7 @@
 /* Copyright (c) 2023-2025 Arm Technology (China) Co. Ltd. */
 
 #include <linux/module.h>
+#include <linux/version.h>
 #include "aipu_dma_buf.h"
 
 static int aipu_dma_buf_attach(struct dma_buf *dmabuf, struct dma_buf_attachment *attach)
@@ -515,4 +516,8 @@ void aipu_detach_dma_buf_by_filp(struct aipu_memory_manager *mm, struct file *fi
 	mutex_unlock(&mm->lock);
 }
 
+#if KERNEL_VERSION(6, 13, 0) <= LINUX_VERSION_CODE
 MODULE_IMPORT_NS("DMA_BUF");
+#else
+MODULE_IMPORT_NS(DMA_BUF);
+#endif

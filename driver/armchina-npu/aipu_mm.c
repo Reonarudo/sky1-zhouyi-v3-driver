@@ -5,6 +5,7 @@
 #include <linux/moduleparam.h>
 #include <asm/cacheflush.h>
 #include <linux/mm.h>
+#include <linux/version.h>
 #include <linux/of.h>
 #include <linux/dma-mapping.h>
 #include <linux/slab.h>
@@ -2378,7 +2379,11 @@ static struct page **aipu_dma_alloc_pages(struct device *dev,
 	struct page **pages;
 	unsigned int i = 0, nid = dev_to_node(dev);
 
+#if KERNEL_VERSION(6, 8, 0) <= LINUX_VERSION_CODE
 	order_mask &= (2U << MAX_PAGE_ORDER) - 1;
+#else
+	order_mask &= (2U << MAX_ORDER) - 1;
+#endif
 	if (!order_mask)
 		return NULL;
 
