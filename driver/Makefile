@@ -7,8 +7,7 @@ SRC_DIR := .
 # `make -C driver` build and for the kernel Kbuild phase (cwd = kernel tree).
 KMD_SELF_DIR := $(dir $(lastword $(MAKEFILE_LIST)))
 -include $(KMD_SELF_DIR)version.mk
-EXTRA_CFLAGS += -DKMD_VERSION=\"$(COMPASS_DRV_BTENVAR_KMD_VERSION)\" \
-                   -I$(PWD)/armchina-npu/ -I$(PWD)/armchina-npu/include -I$(PWD)/armchina-npu/zhouyi
+# ccflags-y only: kbuild no longer reads EXTRA_CFLAGS (6.6 did; 6.18 does not).
 ccflags-y := -DKMD_VERSION=\"$(COMPASS_DRV_BTENVAR_KMD_VERSION)\" \
                    -I$(PWD)/armchina-npu/ -I$(PWD)/armchina-npu/include -I$(PWD)/armchina-npu/zhouyi
 
@@ -25,11 +24,9 @@ COMM_OBJ := armchina-npu/aipu.o \
 
     AIPU_OBJ := armchina-npu/zhouyi/v3.o \
                 armchina-npu/zhouyi/v3_priv.o
-    EXTRA_CFLAGS += -DCONFIG_ARMCHINA_NPU_ARCH_V3
     ccflags-y += -DCONFIG_ARMCHINA_NPU_ARCH_V3
 
     INIT_OBJ := armchina-npu/sky1/sky1.o
-    EXTRA_CFLAGS += -DCONFIG_SKY1
     ccflags-y += -DCONFIG_SKY1
 
 OBJS     := $(COMM_OBJ) $(AIPU_OBJ) $(SOC_OBJ)
