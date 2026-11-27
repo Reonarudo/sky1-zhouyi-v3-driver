@@ -14,6 +14,7 @@ struct cix_aipu_priv {
 	struct device *pd_core[CIX_NPU_PD_MAX_NUM];
 	struct device *opp_pmdomain;
 	struct device_link *opp_dl;
+	bool opp_added;	/* the perf domain's OPPs were added by us, not by its genpd */
 	struct devfreq_dev_profile devfreq_profile;
 	struct devfreq *devfreq;
 };

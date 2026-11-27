@@ -121,8 +121,9 @@ static struct cix_aipu_priv* sky1_priv_init(struct device *dev)
 /*
  * remove_debugfs_dir() deleted. It did
  * debugfs_remove_recursive() on the SCMI perf domain's OPP directory, whose
- * dentry the OPP core caches in an opp_table that outlives this module (it
- * belongs to the persistent SCMI genpd device). The next probe's
+ * dentry the OPP core caches in an opp_table that outlived this module
+ * (the duplicate OPP adds in sky1_npu_devfreq_init() leaked references to
+ * it; see there). The next probe's
  * opp_debug_create_one() then called debugfs_create_dir() with a freed
  * parent and panicked the kernel -- instruction abort at address 0 in
  * start_dirop. The driver could be loaded only once per boot.
@@ -207,12 +208,24 @@ static int sky1_npu_devfreq_init(struct device *dev, struct cix_aipu_priv *cix_a
         goto detach_opp;
     }
 
-    /* Add opps to opp power domain. */
-    ret = aipu_scmi_device_opp_table_parse(cix_aipu_priv->opp_pmdomain);
-    if (ret) {
-        dev_err(dev, "Failed to add opps to the device");
-        ret = -ENODEV;
-        goto unlink_opp;
+    /*
+     * Add the domain's OPPs only if attaching did not already. From 6.7 the
+     * SCMI perf genpd's attach_dev (scmi_pd_attach_dev) adds them to this
+     * virtual device and its detach_dev removes them. Adding them a second
+     * time logged one "_opp_is_duplicate" warning per OPP on every probe,
+     * and each rejected duplicate kept the OPP-table reference
+     * dev_pm_opp_add_dynamic() takes, so the table outlived the virtual
+     * device at detach ("debugfs: 'genpd:0:CIXH4000:00' already exists in
+     * 'opp'" on the next attach).
+     */
+    if (dev_pm_opp_get_opp_count(cix_aipu_priv->opp_pmdomain) <= 0) {
+        ret = aipu_scmi_device_opp_table_parse(cix_aipu_priv->opp_pmdomain);
+        if (ret) {
+            dev_err(dev, "Failed to add opps to the device");
+            ret = -ENODEV;
+            goto unlink_opp;
+        }
+        cix_aipu_priv->opp_added = true;
     }
     opp_count = dev_pm_opp_get_opp_count(cix_aipu_priv->opp_pmdomain);
     if (opp_count <= 0) {
@@ -275,8 +288,11 @@ free_table:
     kfree(profile->freq_table);
     profile->freq_table = NULL;
 unlink_opp:
-    /* the OPPs aipu_scmi_device_opp_table_parse() added, as in remove */
-    dev_pm_opp_remove_table(cix_aipu_priv->opp_pmdomain);
+    /* the OPPs aipu_scmi_device_opp_table_parse() added, if it ran */
+    if (cix_aipu_priv->opp_added) {
+        dev_pm_opp_remove_all_dynamic(cix_aipu_priv->opp_pmdomain);
+        cix_aipu_priv->opp_added = false;
+    }
     device_link_del(cix_aipu_priv->opp_dl);
     cix_aipu_priv->opp_dl = NULL;
 detach_opp:
@@ -316,19 +332,21 @@ static int sky1_npu_devfreq_remove(struct device *dev, struct cix_aipu_priv *cix
     kfree(cix_aipu_priv->devfreq_profile.freq_table);
 
     /*
-     * sky1_npu_devfreq_init() also populated the perf pmdomain's OPP
-     * table via scmi_device_opp_table_parse(). The pmdomain device is
-     * persistent (it lives in SCMI), so without this remove the next
-     * probe sees every frequency added by SCMI as a duplicate and the
-     * OPP core warns "_opp_is_duplicate: duplicate OPPs detected".
+     * The perf domain's OPPs: remove them only if sky1_npu_devfreq_init()
+     * added them itself (a kernel whose SCMI perf genpd does not). They are
+     * dynamic OPPs, which dev_pm_opp_remove_table() -- what this called
+     * before -- leaves in place; it removes static ones only. When the
+     * genpd added them, its detach_dev removes them in
+     * dev_pm_domain_detach() below.
      *
-     * This releases OUR dynamically-added OPPs, which is the
-     * whole of our responsibility here. The supplier's debugfs directory
-     * is the OPP core's to manage; the removal that used to follow this
-     * freed a dentry the OPP core still held and panicked the next probe.
+     * The supplier's debugfs directory is the OPP core's to manage; the
+     * removal that used to follow this freed a dentry the OPP core still
+     * held and panicked the next probe.
      */
-    if (cix_aipu_priv->opp_pmdomain)
-        dev_pm_opp_remove_table(cix_aipu_priv->opp_pmdomain);
+    if (cix_aipu_priv->opp_added) {
+        dev_pm_opp_remove_all_dynamic(cix_aipu_priv->opp_pmdomain);
+        cix_aipu_priv->opp_added = false;
+    }
 
     if (cix_aipu_priv->opp_dl) {
         device_link_del(cix_aipu_priv->opp_dl);

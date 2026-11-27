@@ -1,6 +1,8 @@
 cix-npu-driver (6.2.0-1+zv3.2) stable; urgency=medium
 
   * Load on firmware without an SCMI perf domain: devfreq is optional.
+  * Stop adding the SCMI perf domain's OPPs a second time (6 duplicate-OPP
+    warnings per load and a leaked OPP table).
   * Install the UAPI header as /usr/include/misc/armchina_aipu.h.
   * Drop the EXTRA_CFLAGS lines kbuild no longer reads, and the deprecated
     dkms CLEAN= directive.
