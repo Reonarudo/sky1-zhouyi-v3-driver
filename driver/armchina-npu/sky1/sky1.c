@@ -187,9 +187,16 @@ static int sky1_npu_devfreq_init(struct device *dev, struct cix_aipu_priv *cix_a
 
 	cix_aipu_priv->opp_pmdomain = dev_pm_domain_attach_by_name(dev, "perf");
 
+    /*
+     * No "perf" domain is the normal case on firmware that describes no
+     * SCMI device (the caller reports it). Every exit below leaves
+     * opp_pmdomain and opp_dl NULL, because probe carries on without
+     * devfreq and sky1_npu_devfreq_remove() tests exactly those fields.
+     */
     if (IS_ERR_OR_NULL(cix_aipu_priv->opp_pmdomain)) {
-        dev_err(dev, "Failed to get perf domain");
-        return -EFAULT;
+        ret = cix_aipu_priv->opp_pmdomain ? PTR_ERR(cix_aipu_priv->opp_pmdomain) : -ENODEV;
+        cix_aipu_priv->opp_pmdomain = NULL;
+        return ret;
     }
     cix_aipu_priv->opp_dl = device_link_add(dev, cix_aipu_priv->opp_pmdomain,
                             DL_FLAG_RPM_ACTIVE |
@@ -268,10 +275,13 @@ free_table:
     kfree(profile->freq_table);
     profile->freq_table = NULL;
 unlink_opp:
+    /* the OPPs aipu_scmi_device_opp_table_parse() added, as in remove */
+    dev_pm_opp_remove_table(cix_aipu_priv->opp_pmdomain);
     device_link_del(cix_aipu_priv->opp_dl);
     cix_aipu_priv->opp_dl = NULL;
 detach_opp:
     dev_pm_domain_detach(cix_aipu_priv->opp_pmdomain, true);
+    cix_aipu_priv->opp_pmdomain = NULL;
 
     return ret;
 }
@@ -492,11 +502,20 @@ static int sky1_npu_probe(struct platform_device *p_dev)
 	goto err_teardown_cores;
 #endif
 
+	/*
+	 * devfreq is optional. It needs the SCMI "perf" power domain, which
+	 * exists only when the firmware describes an SCMI device -- on the
+	 * Orion O6 that is the BIOS option "Enable ACPI SCMI", off by
+	 * default. Without it the NPU runs at the clock the firmware set;
+	 * with it, a sweep across devfreq's whole OPP table moved inference
+	 * time by 0.14 %. A failure here used to fail the whole probe, which
+	 * left no /dev/aipu on those boards.
+	 */
 	ret = sky1_npu_devfreq_init(&p_dev->dev, cix_aipu_priv);
-	if (ret) {
-		dev_err(&p_dev->dev, "aipu devfreq init failed, ret: %d\n", ret);
-		goto err_teardown_cores;
-	}
+	if (ret)
+		dev_warn(&p_dev->dev,
+			 "devfreq unavailable (%d), continuing without it (no SCMI perf domain?)\n",
+			 ret);
 
 #ifdef CONFIG_PM
 	pm_runtime_get_noresume(&p_dev->dev);

@@ -84,11 +84,15 @@ make COMPASS_DRV_BTENVAR_KPATH=/path/to/linux-headers   # another kernel
 - **Zero-copy weights.** New WBUF / SLOT ioctls (see below).
 - **Faster lookups.** Buffer and TCB lookups use rb-trees instead of walking every buffer on
   each submit; IOVA allocation for ASIDs 1–3 is fixed.
+- **devfreq is optional.** devfreq needs an SCMI perf domain, which exists only when the firmware
+  describes SCMI (on the Orion O6, BIOS → Device Manager → Platform Configuration → Compliance
+  Configuration → *Enable ACPI SCMI*, off by default). Without it the driver logs
+  `devfreq unavailable` and loads anyway; the NPU runs at the firmware's clock.
 
 ## Userspace interface
 
 `driver/armchina-npu/include/armchina_aipu.h` is CIX 6.2.0's header (identical to CIX 6.0.1's)
-plus five ioctls:
+plus five ioctls. The package installs it as `/usr/include/misc/armchina_aipu.h`.
 
 | Ioctl | Nr | Purpose |
 | --- | --- | --- |
